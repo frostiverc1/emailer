@@ -1,0 +1,16 @@
+docs
+CLAUDE.md
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+.terraform.tfstate.lock.info
+
+# Lambda packaging artifacts (built locally by terraform apply)
+infra/build/
+__pycache__/
+*.pyc

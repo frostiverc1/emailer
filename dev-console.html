@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Email service, dev console</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 15px; margin-top: 32px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }
+  section { margin-bottom: 24px; }
+  label { display: block; font-size: 12px; color: #555; margin-top: 8px; }
+  input, textarea, select { width: 100%; padding: 6px 8px; margin-top: 2px; font-family: inherit; font-size: 13px; box-sizing: border-box; }
+  textarea { font-family: monospace; min-height: 70px; }
+  button { margin-top: 10px; padding: 6px 14px; font-size: 13px; cursor: pointer; }
+  pre { background: #f5f5f5; padding: 10px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 1; }
+  .note { font-size: 12px; color: #777; }
+</style>
+</head>
+<body>
+
+<h1>Email service, dev console</h1>
+<p class="note">Local testing only. Talks to the deployed pilot API Gateway, not a local backend.</p>
+
+<section>
+  <h2>Config</h2>
+  <label>API base URL (API Gateway invoke URL)</label>
+  <input id="apiBase" placeholder="https://xxxx.execute-api.us-east-1.amazonaws.com">
+</section>
+
+<section>
+  <h2>Services</h2>
+  <div class="row">
+    <div>
+      <label>Name</label>
+      <input id="svcName" placeholder="Gencoft Internal">
+    </div>
+    <div>
+      <label>Verified SES from address</label>
+      <input id="svcSesFrom" placeholder="yourname@gencoft.com">
+    </div>
+  </div>
+  <p class="note">For the pilot, services use a verified SES address directly, no OAuth connect step. Verify the address in the SES console first.</p>
+  <button onclick="createService()">Create service</button>
+  <button onclick="listServices()">List services</button>
+  <pre id="svcOut"></pre>
+</section>
+
+<section>
+  <h2>Templates</h2>
+  <label>Service ID</label>
+  <input id="tplSvcId" placeholder="svc_xxx">
+  <label>Template ID</label>
+  <input id="tplId" placeholder="tpl_welcome">
+  <label>Subject template</label>
+  <input id="tplSubject" placeholder="Welcome, {{ to_name }}!">
+  <label>HTML body template</label>
+  <textarea id="tplHtml" placeholder="<h1>Hello {{ to_name }}</h1><p>{{ message }}</p>"></textarea>
+  <label>Text body template (optional)</label>
+  <textarea id="tplText" placeholder="Hello {{ to_name }}\n\n{{ message }}"></textarea>
+  <button onclick="createTemplate()">Create template</button>
+  <button onclick="listTemplates()">List templates for this service</button>
+  <pre id="tplOut"></pre>
+</section>
+
+<section>
+  <h2>Send test email</h2>
+  <label>API key</label>
+  <input id="sendApiKey" placeholder="gk_xxx">
+  <div class="row">
+    <div>
+      <label>Service ID</label>
+      <input id="sendSvcId" placeholder="svc_xxx">
+    </div>
+    <div>
+      <label>Template ID</label>
+      <input id="sendTplId" placeholder="tpl_welcome">
+    </div>
+  </div>
+  <label>Template params (JSON, must include to_email)</label>
+  <textarea id="sendParams">{&#10;  "to_email": "you@example.com",&#10;  "to_name": "Test",&#10;  "message": "Hello from the dev console"&#10;}</textarea>
+  <button onclick="sendTest()">Send test email</button>
+  <pre id="sendOut"></pre>
+</section>
+
+<script>
+function base() { return document.getElementById('apiBase').value.replace(/\/$/, ''); }
+async function callApi(path, opts, outEl) {
+  const el = document.getElementById(outEl);
+  el.textContent = 'Loading...';
+  try {
+    const res = await fetch(base() + path, opts || {});
+    const text = await res.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = text; }
+    el.textContent = res.status + '\n' + JSON.stringify(parsed, null, 2);
+  } catch (err) {
+    el.textContent = 'Request failed: ' + err.message;
+  }
+}
+
+function createService() {
+  const name = document.getElementById('svcName').value;
+  const sesFrom = document.getElementById('svcSesFrom').value;
+  callApi('/admin/services', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, provider_type: 'ses', ses_from_email: sesFrom }),
+  }, 'svcOut');
+}
+
+function listServices() {
+  callApi('/admin/services', {}, 'svcOut');
+}
+
+function createTemplate() {
+  const body = {
+    service_id: document.getElementById('tplSvcId').value,
+    template_id: document.getElementById('tplId').value,
+    subject_tpl: document.getElementById('tplSubject').value,
+    html_tpl: document.getElementById('tplHtml').value,
+    text_tpl: document.getElementById('tplText').value || undefined,
+  };
+  callApi('/admin/templates', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }, 'tplOut');
+}
+
+function listTemplates() {
+  const svcId = document.getElementById('tplSvcId').value;
+  callApi('/admin/templates?service_id=' + encodeURIComponent(svcId), {}, 'tplOut');
+}
+
+function sendTest() {
+  let params;
+  try {
+    params = JSON.parse(document.getElementById('sendParams').value);
+  } catch (err) {
+    document.getElementById('sendOut').textContent = 'Invalid JSON in template params: ' + err.message;
+    return;
+  }
+  const body = {
+    service_id: document.getElementById('sendSvcId').value,
+    template_id: document.getElementById('sendTplId').value,
+    template_params: params,
+  };
+  callApi('/v1/send', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': document.getElementById('sendApiKey').value,
+    },
+    body: JSON.stringify(body),
+  }, 'sendOut');
+}
+</script>
+
+</body>
+</html>
