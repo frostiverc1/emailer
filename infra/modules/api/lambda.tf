@@ -30,13 +30,8 @@ resource "aws_iam_role_policy" "validate" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
         Resource = var.ops_table_arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["dynamodb:GetItem"]
-        Resource = var.suppression_table_arn
       },
       {
         Effect   = "Allow"
@@ -64,9 +59,8 @@ resource "aws_lambda_function" "validate" {
 
   environment {
     variables = {
-      OPS_TABLE_NAME         = var.ops_table_name
-      SUPPRESSION_TABLE_NAME = var.suppression_table_name
-      QUEUE_URL              = var.queue_url
+      OPS_TABLE_NAME = var.ops_table_name
+      QUEUE_URL      = var.queue_url
     }
   }
 

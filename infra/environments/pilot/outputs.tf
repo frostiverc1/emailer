@@ -6,10 +6,6 @@ output "ops_table_name" {
   value = module.storage.ops_table_name
 }
 
-output "suppression_table_name" {
-  value = module.storage.suppression_table_name
-}
-
 output "queue_url" {
   value = module.queue.queue_url
 }

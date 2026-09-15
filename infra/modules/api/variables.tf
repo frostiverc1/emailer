@@ -11,14 +11,6 @@ variable "ops_table_arn" {
   type = string
 }
 
-variable "suppression_table_name" {
-  type = string
-}
-
-variable "suppression_table_arn" {
-  type = string
-}
-
 variable "queue_url" {
   type = string
 }

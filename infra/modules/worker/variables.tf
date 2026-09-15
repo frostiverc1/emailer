@@ -20,6 +20,16 @@ variable "ses_region" {
   type        = string
 }
 
+variable "max_receive_count" {
+  description = "Send queue maxReceiveCount, so the worker can tell when a retry is the last one"
+  type        = number
+}
+
+variable "alarm_topic_arn" {
+  description = "SNS topic notified when sends are blocked by SES account pause or daily quota"
+  type        = string
+}
+
 variable "tags" {
   description = "Common tags applied to all resources in this module"
   type        = map(string)

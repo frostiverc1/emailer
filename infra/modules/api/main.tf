@@ -2,6 +2,14 @@ resource "aws_apigatewayv2_api" "this" {
   name          = "${var.name_prefix}-api"
   protocol_type = "HTTP"
   tags          = var.tags
+
+  # Lets browser-based callers (dev-console.html, a future dashboard) call the API cross-origin.
+  # HTTP APIs handle preflight OPTIONS automatically once this is set, no separate OPTIONS routes needed.
+  cors_configuration {
+    allow_origins = ["*"]
+    allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    allow_headers = ["content-type", "x-api-key"]
+  }
 }
 
 resource "aws_apigatewayv2_stage" "default" {
@@ -54,6 +62,7 @@ locals {
     "PUT /admin/templates/{id}",
     "DELETE /admin/templates/{id}",
     "GET /admin/usage/{api_key}",
+    "GET /admin/emails/{request_id}",
   ]
 }
 

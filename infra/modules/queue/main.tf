@@ -1,3 +1,7 @@
+locals {
+  max_receive_count = 3
+}
+
 resource "aws_sqs_queue" "dlq" {
   name                      = "${var.name_prefix}-dlq"
   message_retention_seconds = 14 * 24 * 60 * 60
@@ -13,7 +17,7 @@ resource "aws_sqs_queue" "send_queue" {
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dlq.arn
-    maxReceiveCount     = 3
+    maxReceiveCount     = local.max_receive_count
   })
 
   tags = var.tags

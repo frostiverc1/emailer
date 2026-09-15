@@ -4,9 +4,9 @@ variable "name_prefix" {
 }
 
 variable "visibility_timeout_seconds" {
-  description = "SQS visibility timeout, should match the worker Lambda timeout"
+  description = "SQS visibility timeout. Keep at least 6x the worker Lambda timeout (AWS guidance for SQS event sources) and above the worker's LEASE_SECONDS"
   type        = number
-  default     = 60
+  default     = 360
 }
 
 variable "alarm_email" {

@@ -8,14 +8,6 @@ variable "ses_verified_emails" {
   type        = list(string)
 }
 
-variable "suppression_table_name" {
-  type = string
-}
-
-variable "suppression_table_arn" {
-  type = string
-}
-
 variable "tags" {
   description = "Common tags applied to all resources in this module"
   type        = map(string)

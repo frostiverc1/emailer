@@ -38,6 +38,8 @@ def handler(event, context):
         return _delete_template(params.get("id"), qs)
     if route == "GET /admin/usage/{api_key}":
         return _get_usage(params.get("api_key"))
+    if route == "GET /admin/emails/{request_id}":
+        return _get_email(params.get("request_id"))
 
     return _resp(404, {"error": "Unknown route"})
 
@@ -171,6 +173,29 @@ def _get_usage(api_key):
         "count": int(i.get("count", 0)),
     } for i in result.get("Items", [])]
     return _resp(200, {"api_key": api_key, "usage": days})
+
+
+def _get_email(request_id):
+    if not request_id:
+        return _resp(400, {"error": "request_id path param is required"})
+
+    item = table.get_item(Key={"PK": f"EMAIL#{request_id}", "SK": "META"}).get("Item")
+    if not item:
+        return _resp(404, {"error": "Email not found"})
+    return _resp(200, {
+        "request_id": request_id,
+        "status": item.get("status"),
+        "service_id": item.get("service_id"),
+        "template_id": item.get("template_id"),
+        "to_email": item.get("to_email"),
+        "attempts": int(item.get("attempts", 0)),
+        "created_at": item.get("created_at"),
+        "sent_at": item.get("sent_at"),
+        "failed_at": item.get("failed_at"),
+        "ses_message_id": item.get("ses_message_id"),
+        "error_code": item.get("error_code"),
+        "error_message": item.get("error_message"),
+    })
 
 
 def _scan_prefix(pk_prefix, sk_value):

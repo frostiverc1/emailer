@@ -1,15 +1,22 @@
 import json
+import logging
 import os
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import boto3
 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
 ops_table = boto3.resource("dynamodb").Table(os.environ["OPS_TABLE_NAME"])
-suppression_table = boto3.resource("dynamodb").Table(os.environ["SUPPRESSION_TABLE_NAME"])
 sqs = boto3.client("sqs")
 QUEUE_URL = os.environ["QUEUE_URL"]
+
+# Fixed width so the worker's lease check can compare timestamps as strings.
+TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+EMAIL_RECORD_TTL_SECONDS = 30 * 86400
 
 
 def handler(event, context):
@@ -66,29 +73,61 @@ def handler(event, context):
     if int(usage["Attributes"]["count"]) > int(item.get("daily_limit", 500)):
         return _resp(429, {"error": "Daily quota exceeded"})
 
-    # --- 5. bounce suppression check (suppression table) ---
-    suppression = suppression_table.get_item(
-        Key={"PK": f"BOUNCE#{to_email}", "SK": "META"},
-        ProjectionExpression="suppressed",
-    )
-    if suppression.get("Item", {}).get("suppressed", False):
-        return _resp(422, {"error": "Recipient suppressed due to bounces"})
-
-    # --- 6. queue the job ---
+    # --- 5. email record: status log, and the worker's idempotency gate ---
+    # Written before the SQS message so the worker never sees a message without a record.
     request_id = str(uuid.uuid4())
-    sqs.send_message(
-        QueueUrl=QUEUE_URL,
-        MessageBody=json.dumps({
-            "request_id": request_id,
-            "api_key": api_key,
+    email_key = {"PK": f"EMAIL#{request_id}", "SK": "META"}
+    ops_table.put_item(
+        Item={
+            **email_key,
+            "status": "queued",
             "service_id": body["service_id"],
             "template_id": body["template_id"],
-            "template_params": body["template_params"],
-            "queued_at": datetime.utcnow().isoformat(),
-        }),
+            "to_email": to_email,
+            "attempts": 0,
+            "created_at": datetime.now(timezone.utc).strftime(TS_FORMAT),
+            "ttl": int(time.time()) + EMAIL_RECORD_TTL_SECONDS,
+        },
+        ConditionExpression="attribute_not_exists(PK)",
     )
 
+    # --- 6. queue the job ---
+    try:
+        sqs.send_message(
+            QueueUrl=QUEUE_URL,
+            MessageBody=json.dumps({
+                "request_id": request_id,
+                "api_key": api_key,
+                "service_id": body["service_id"],
+                "template_id": body["template_id"],
+                "template_params": body["template_params"],
+                "queued_at": datetime.utcnow().isoformat(),
+            }),
+        )
+    except Exception as exc:
+        logger.exception(f"Failed to queue email | request_id={request_id}")
+        _mark_queue_failed(email_key, exc)
+        return _resp(500, {"error": "Failed to queue email"})
+
     return _resp(202, {"status": "queued", "request_id": request_id})
+
+
+def _mark_queue_failed(email_key, exc):
+    # Best effort: if this also fails, the record stays "queued" and is never picked up.
+    try:
+        ops_table.update_item(
+            Key=email_key,
+            UpdateExpression="SET #s = :failed, failed_at = :now, error_code = :code, error_message = :msg",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":failed": "failed",
+                ":now": datetime.now(timezone.utc).strftime(TS_FORMAT),
+                ":code": "QUEUE_ERROR",
+                ":msg": str(exc)[:1000],
+            },
+        )
+    except Exception:
+        logger.exception(f"Failed to mark email QUEUE_ERROR | {email_key['PK']}")
 
 
 def _resp(status, body):

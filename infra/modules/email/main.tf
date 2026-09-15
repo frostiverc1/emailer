@@ -9,13 +9,7 @@ resource "aws_ses_configuration_set" "this" {
   name = var.name_prefix
 }
 
-resource "aws_ses_event_destination" "sns" {
-  name                   = "${var.name_prefix}-sns-events"
-  configuration_set_name = aws_ses_configuration_set.this.name
-  enabled                = true
-  matching_types         = ["bounce", "complaint"]
-
-  sns_destination {
-    topic_arn = aws_sns_topic.feedback.arn
-  }
+# Account-wide, not per-service: a complaint against one sender suppresses the address for every sender.
+resource "aws_sesv2_account_suppression_attributes" "this" {
+  suppressed_reasons = ["BOUNCE", "COMPLAINT"]
 }

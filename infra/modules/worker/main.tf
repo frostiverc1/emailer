@@ -29,7 +29,7 @@ resource "aws_iam_role_policy" "worker" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem"]
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
         Resource = var.ops_table_arn
       },
       {
@@ -64,8 +64,11 @@ resource "aws_lambda_function" "worker" {
 
   environment {
     variables = {
-      OPS_TABLE_NAME = var.ops_table_name
-      SES_REGION     = var.ses_region
+      OPS_TABLE_NAME    = var.ops_table_name
+      SES_REGION        = var.ses_region
+      MAX_RECEIVE_COUNT = var.max_receive_count
+      # Must exceed the Lambda timeout and stay below the queue visibility timeout.
+      LEASE_SECONDS = 90
     }
   }
 
@@ -82,4 +85,33 @@ resource "aws_lambda_event_source_mapping" "worker" {
   event_source_arn = var.queue_arn
   function_name    = aws_lambda_function.worker.arn
   batch_size       = 1
+}
+
+# Permanent failures skip the DLQ, so an account-wide SES block needs its own alarm.
+resource "aws_cloudwatch_log_metric_filter" "ses_blocked" {
+  name           = "${var.name_prefix}-ses-blocked"
+  log_group_name = aws_cloudwatch_log_group.worker.name
+  pattern        = "?\"error_code=SES_ACCOUNT_PAUSED\" ?\"error_code=SES_DAILY_QUOTA\""
+
+  metric_transformation {
+    name      = "SesBlockedSends"
+    namespace = "${var.name_prefix}/worker"
+    value     = "1"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "ses_blocked" {
+  alarm_name          = "${var.name_prefix}-ses-blocked"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = aws_cloudwatch_log_metric_filter.ses_blocked.metric_transformation[0].name
+  namespace           = aws_cloudwatch_log_metric_filter.ses_blocked.metric_transformation[0].namespace
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_description   = "Worker sends are failing because SES paused the account or the daily quota is exhausted"
+  alarm_actions       = [var.alarm_topic_arn]
+
+  tags = var.tags
 }
