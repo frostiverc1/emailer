@@ -1,6 +1,7 @@
 docs
+.claude
 CLAUDE.md
-
+build/
 # Terraform
 **/.terraform/
 *.tfstate

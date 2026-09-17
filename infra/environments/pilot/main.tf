@@ -37,5 +37,6 @@ module "api" {
   ops_table_arn  = module.storage.ops_table_arn
   queue_url      = module.queue.queue_url
   queue_arn      = module.queue.queue_arn
+  ses_region     = var.aws_region
   tags           = var.tags
 }

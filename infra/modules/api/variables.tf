@@ -19,6 +19,11 @@ variable "queue_arn" {
   type = string
 }
 
+variable "ses_region" {
+  description = "AWS region where customer domains are verified as SES identities"
+  type        = string
+}
+
 variable "tags" {
   description = "Common tags applied to all resources in this module"
   type        = map(string)

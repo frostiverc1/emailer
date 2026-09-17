@@ -22,6 +22,10 @@ def handler(event, context):
     except json.JSONDecodeError:
         return _resp(400, {"error": "Invalid JSON"})
 
+    if route == "POST /admin/accounts":
+        return _create_account(body)
+    if route == "GET /admin/accounts":
+        return _list_accounts()
     if route == "POST /admin/services":
         return _create_service(body)
     if route == "GET /admin/services":
@@ -44,19 +48,46 @@ def handler(event, context):
     return _resp(404, {"error": "Unknown route"})
 
 
+def _create_account(body):
+    if not body.get("name"):
+        return _resp(400, {"error": "Missing field: name"})
+
+    account_id = f"acct_{uuid.uuid4().hex[:16]}"
+    table.put_item(Item={
+        "PK": f"ACCT#{account_id}",
+        "SK": "META",
+        "name": body["name"],
+        "created_at": datetime.utcnow().isoformat(),
+    })
+    return _resp(201, {"account_id": account_id})
+
+
+def _list_accounts():
+    items = _scan_prefix("ACCT#", "META")
+    accounts = [{
+        "account_id": i["PK"].removeprefix("ACCT#"),
+        "name": i.get("name"),
+        "created_at": i.get("created_at"),
+    } for i in items]
+    return _resp(200, {"accounts": accounts})
+
+
 def _create_service(body):
-    for field in ("name", "provider_type"):
+    for field in ("account_id", "name", "provider_type"):
         if field not in body:
             return _resp(400, {"error": f"Missing field: {field}"})
     if body["provider_type"] != "ses":
         return _resp(400, {"error": "Only provider_type=ses is supported in the pilot"})
     if not body.get("ses_from_email"):
         return _resp(400, {"error": "ses_from_email is required for provider_type=ses"})
+    if "Item" not in table.get_item(Key={"PK": f"ACCT#{body['account_id']}", "SK": "META"}):
+        return _resp(404, {"error": "Account not found"})
 
     service_id = f"svc_{uuid.uuid4().hex[:16]}"
     table.put_item(Item={
         "PK": f"SVC#{service_id}",
         "SK": "META",
+        "account_id": body["account_id"],
         "name": body["name"],
         "provider_type": "ses",
         "ses_from_email": body["ses_from_email"],
@@ -69,6 +100,7 @@ def _list_services():
     items = _scan_prefix("SVC#", "META")
     services = [{
         "service_id": i["PK"].removeprefix("SVC#"),
+        "account_id": i.get("account_id"),
         "name": i.get("name"),
         "provider_type": i.get("provider_type"),
         "ses_from_email": i.get("ses_from_email"),

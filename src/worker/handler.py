@@ -1,13 +1,7 @@
 import json
 import os
 import logging
-import smtplib
-import base64
 from datetime import datetime, timedelta, timezone
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from urllib.parse import urlencode
-import urllib.request
 import boto3
 from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 from jinja2 import Template, TemplateSyntaxError
@@ -17,7 +11,6 @@ logger.setLevel(logging.INFO)
 
 table = boto3.resource("dynamodb").Table(os.environ["OPS_TABLE_NAME"])
 ses = boto3.client("ses", region_name=os.environ.get("SES_REGION", "us-east-1"))
-kms = boto3.client("kms")  # only used once the OAuth/SMTP paths are actually built
 
 MAX_RECEIVE_COUNT = int(os.environ["MAX_RECEIVE_COUNT"])
 LEASE_SECONDS = int(os.environ["LEASE_SECONDS"])
@@ -40,11 +33,6 @@ TRANSIENT_DYNAMODB_ERRORS = {
 }
 # SES reports both sending-rate and daily-quota limits as "Throttling"; only the message tells them apart.
 DAILY_QUOTA_MARKER = "daily message quota exceeded"
-
-# GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET env vars are not needed for the pilot,
-# only wire these up when _send_via_oauth_smtp actually gets used post-pilot
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
 
 class PermanentError(Exception):
@@ -132,7 +120,7 @@ def _process(msg):
     tpl_id = msg["template_id"]
     request_id = msg["request_id"]
 
-    # 1. fetch service config (full record, no projection now that provider_type branches the send path)
+    # 1. fetch service config
     svc = table.get_item(Key={"PK": f"SVC#{svc_id}", "SK": "META"})
     if "Item" not in svc:
         raise PermanentError("SERVICE_NOT_FOUND", f"Service not found: {svc_id}")
@@ -154,20 +142,15 @@ def _process(msg):
     html_body = Template(t["html_tpl"]).render(**params)
     text_body = Template(t["text_tpl"]).render(**params) if t.get("text_tpl") else None
 
-    # 4. branch by provider
+    # 4. send via SES, the only provider
     provider = svc_full.get("provider_type", "ses")
     to_email = params["to_email"]
 
-    if provider == "ses":
-        if not svc_full.get("ses_from_email"):
-            raise PermanentError("SERVICE_MISCONFIGURED", f"Service {svc_id} has no ses_from_email")
-        message_id = _send_via_ses(svc_full["ses_from_email"], to_email, subject, html_body, text_body, request_id, msg["api_key"])
-    elif provider in ("google", "outlook"):
-        message_id = _send_via_oauth_smtp(svc_full, to_email, subject, html_body, text_body)
-    elif provider == "smtp":
-        message_id = _send_via_plain_smtp(svc_full, to_email, subject, html_body, text_body)
-    else:
+    if provider != "ses":
         raise PermanentError("SERVICE_MISCONFIGURED", f"Unknown provider_type: {provider}")
+    if not svc_full.get("ses_from_email"):
+        raise PermanentError("SERVICE_MISCONFIGURED", f"Service {svc_id} has no ses_from_email")
+    message_id = _send_via_ses(svc_full["ses_from_email"], to_email, subject, html_body, text_body, request_id, msg["api_key"])
 
     logger.info(f"Sent email | request_id={request_id} to={to_email} provider={provider}")
     return message_id
@@ -242,53 +225,3 @@ def _send_via_ses(from_email, to_email, subject, html_body, text_body, request_i
     )
     return response["MessageId"]
 
-
-def _send_via_oauth_smtp(svc, to_email, subject, html_body, text_body):
-    # Deferred, not part of the pilot build, see docs/email-service-pilot-lld.md section 4.
-    refresh_token = kms.decrypt(CiphertextBlob=base64.b64decode(svc["encrypted_refresh_token"]))["Plaintext"].decode()
-    access_token = _refresh_google_access_token(refresh_token)  # Outlook variant follows the same shape against Microsoft's token endpoint, deferred
-
-    auth_string = f"user={svc['from_email']}\x01auth=Bearer {access_token}\x01\x01"
-    auth_b64 = base64.b64encode(auth_string.encode()).decode()
-
-    smtp_host = "smtp.gmail.com" if svc["provider_type"] == "google" else "smtp.office365.com"
-    mime_msg = _build_mime_message(svc["from_email"], to_email, subject, html_body, text_body)
-
-    with smtplib.SMTP(smtp_host, 587) as smtp:
-        smtp.starttls()
-        smtp.docmd("AUTH", "XOAUTH2 " + auth_b64)
-        smtp.sendmail(svc["from_email"], [to_email], mime_msg.as_string())
-
-
-def _send_via_plain_smtp(svc, to_email, subject, html_body, text_body):
-    # Deferred, not part of the pilot build, see docs/email-service-pilot-lld.md section 4.
-    password = kms.decrypt(CiphertextBlob=base64.b64decode(svc["encrypted_smtp_password"]))["Plaintext"].decode()
-    mime_msg = _build_mime_message(svc["from_email"], to_email, subject, html_body, text_body)
-
-    with smtplib.SMTP(svc["smtp_host"], int(svc["smtp_port"])) as smtp:
-        smtp.starttls()
-        smtp.login(svc["from_email"], password)
-        smtp.sendmail(svc["from_email"], [to_email], mime_msg.as_string())
-
-
-def _build_mime_message(from_email, to_email, subject, html_body, text_body):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = from_email
-    msg["To"] = to_email
-    if text_body:
-        msg.attach(MIMEText(text_body, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
-    return msg
-
-
-def _refresh_google_access_token(refresh_token):
-    data = urlencode({
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "refresh_token": refresh_token,
-        "grant_type": "refresh_token",
-    }).encode()
-    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())["access_token"]

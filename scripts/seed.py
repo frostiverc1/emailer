@@ -1,4 +1,4 @@
-"""Seed script for pilot bootstrapping: one service, one API key, one sample template.
+"""Seed script for pilot bootstrapping: one account, one service, one API key, one sample template.
 
 Requires OPS_TABLE_NAME and SEED_SES_FROM_EMAIL env vars. SEED_SES_FROM_EMAIL must
 already be a verified SES identity (see docs/email-service-pilot-lld.md section 7).
@@ -12,12 +12,21 @@ table = boto3.resource("dynamodb").Table(os.environ["OPS_TABLE_NAME"])
 SES_FROM_EMAIL = os.environ["SEED_SES_FROM_EMAIL"]
 ALLOWED_ORIGINS = os.environ.get("SEED_ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 
+ACCOUNT_ID = "acct_gencoft_internal"
 SERVICE_ID = "svc_gencoft_internal"
 API_KEY = f"gk_{uuid.uuid4().hex[:24]}"
 
 table.put_item(Item={
+    "PK": f"ACCT#{ACCOUNT_ID}",
+    "SK": "META",
+    "name": "Gencoft Internal",
+    "created_at": "2024-01-01T00:00:00",
+})
+
+table.put_item(Item={
     "PK": f"SVC#{SERVICE_ID}",
     "SK": "META",
+    "account_id": ACCOUNT_ID,
     "name": "Gencoft Internal",
     "provider_type": "ses",
     "ses_from_email": SES_FROM_EMAIL,
@@ -43,5 +52,5 @@ table.put_item(Item={
     "updated_at": "2024-01-01T00:00:00Z",
 })
 
-print(f"Seeded service_id={SERVICE_ID}")
+print(f"Seeded account_id={ACCOUNT_ID} service_id={SERVICE_ID}")
 print(f"API key: {API_KEY}")
