@@ -31,22 +31,35 @@
   <h2>Config</h2>
   <label>API base URL (API Gateway invoke URL)</label>
   <input id="apiBase" placeholder="https://xxxx.execute-api.us-east-1.amazonaws.com">
+  <label>Cognito app client ID (terraform output user_pool_client_id)</label>
+  <input id="clientId" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxx">
 </section>
 
 <section>
-  <h2>Accounts</h2>
-  <label>Account name</label>
-  <input id="acctName" placeholder="Acme Inc">
-  <p class="note">Every service and domain belongs to a customer account.</p>
-  <button onclick="createAccount()">Create account</button>
-  <button onclick="listAccounts()">List accounts</button>
-  <pre id="acctOut"></pre>
+  <h2>Login</h2>
+  <div class="row">
+    <div>
+      <label>Email</label>
+      <input id="authEmail" type="email" placeholder="you@acme.com">
+    </div>
+    <div>
+      <label>Password</label>
+      <input id="authPassword" type="password" placeholder="8+ chars, upper, lower, number">
+    </div>
+  </div>
+  <label>Confirmation code (emailed after sign up)</label>
+  <input id="authCode" placeholder="123456">
+  <button onclick="signUp()">Sign up</button>
+  <button onclick="confirmSignUp()">Confirm code</button>
+  <button onclick="logIn()">Log in</button>
+  <button onclick="logOut()">Log out</button>
+  <p class="note">Sign up, enter the emailed code and confirm, then log in. Everything below only shows your own services, templates and domains.</p>
+  <div class="status" id="authStatus">Not logged in</div>
+  <pre id="authOut"></pre>
 </section>
 
 <section>
   <h2>Services</h2>
-  <label>Account ID</label>
-  <input id="svcAcctId" placeholder="acct_xxx">
   <div class="row">
     <div>
       <label>Name</label>
@@ -60,21 +73,25 @@
   <p class="note">For the pilot, services use a verified SES address directly, no OAuth connect step. Verify the address in the SES console first.</p>
   <button onclick="createService()">Create service</button>
   <button onclick="listServices()">List services</button>
+  <div class="row">
+    <div>
+      <label>Service ID (for a new API key)</label>
+      <input id="keySvcId" placeholder="svc_xxx">
+    </div>
+    <div>
+      <label>Allowed origins (optional, comma separated)</label>
+      <input id="keyOrigins" placeholder="https://acme.com, http://localhost:3000">
+    </div>
+  </div>
+  <button onclick="createApiKey()">Create API key</button>
+  <p class="note">Creating a service fills in its ID here. Leave origins empty to allow any site. The new key is filled into Send test email and Usage below.</p>
   <pre id="svcOut"></pre>
 </section>
 
 <section>
   <h2>Domains</h2>
-  <div class="row">
-    <div>
-      <label>Account ID</label>
-      <input id="domAcctId" placeholder="acct_xxx">
-    </div>
-    <div>
-      <label>Domain</label>
-      <input id="domName" placeholder="acme.com">
-    </div>
-  </div>
+  <label>Domain</label>
+  <input id="domName" placeholder="acme.com">
   <button onclick="addDomain()">Add domain</button>
   <button onclick="listDomains()">List domains</button>
   <button onclick="viewDomain()">View domain</button>
@@ -150,11 +167,15 @@
 
 <script>
 function base() { return document.getElementById('apiBase').value.replace(/\/$/, ''); }
+let accessToken = null;
+
 async function callApi(path, opts, outEl) {
   const el = document.getElementById(outEl);
   el.textContent = 'Loading...';
+  opts = opts || {};
+  if (accessToken) opts.headers = { ...opts.headers, Authorization: 'Bearer ' + accessToken };
   try {
-    const res = await fetch(base() + path, opts || {});
+    const res = await fetch(base() + path, opts);
     const text = await res.text();
     if (!text) {
       el.textContent = res.status + '\n(no content)';
@@ -170,27 +191,81 @@ async function callApi(path, opts, outEl) {
   }
 }
 
-function createAccount() {
-  callApi('/admin/accounts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: document.getElementById('acctName').value }),
-  }, 'acctOut');
+// Cognito's API is called directly, no SDK. The user pool lives in the same region as the API.
+async function cognito(action, payload) {
+  const region = (base().match(/execute-api\.([a-z0-9-]+)\./) || [])[1] || 'us-east-1';
+  const el = document.getElementById('authOut');
+  el.textContent = 'Loading...';
+  try {
+    const res = await fetch('https://cognito-idp.' + region + '.amazonaws.com/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-amz-json-1.1',
+        'X-Amz-Target': 'AWSCognitoIdentityProviderService.' + action,
+      },
+      body: JSON.stringify({ ClientId: document.getElementById('clientId').value.trim(), ...payload }),
+    });
+    const data = await res.json().catch(() => ({}));
+    el.textContent = res.ok ? action + ': ok' : action + ' failed: ' + (data.message || data.__type || res.status);
+    return res.ok ? data : null;
+  } catch (err) {
+    el.textContent = 'Request failed: ' + err.message;
+    return null;
+  }
 }
 
-function listAccounts() {
-  callApi('/admin/accounts', {}, 'acctOut');
+function authEmail() { return document.getElementById('authEmail').value.trim(); }
+
+function signUp() {
+  cognito('SignUp', {
+    Username: authEmail(),
+    Password: document.getElementById('authPassword').value,
+    UserAttributes: [{ Name: 'email', Value: authEmail() }],
+  });
 }
 
-function createService() {
-  const accountId = document.getElementById('svcAcctId').value;
+function confirmSignUp() {
+  cognito('ConfirmSignUp', { Username: authEmail(), ConfirmationCode: document.getElementById('authCode').value.trim() });
+}
+
+async function logIn() {
+  const data = await cognito('InitiateAuth', {
+    AuthFlow: 'USER_PASSWORD_AUTH',
+    AuthParameters: { USERNAME: authEmail(), PASSWORD: document.getElementById('authPassword').value },
+  });
+  if (!data || !data.AuthenticationResult) return;
+  accessToken = data.AuthenticationResult.AccessToken;
+  document.getElementById('authStatus').textContent = 'Logged in as ' + authEmail();
+}
+
+function logOut() {
+  accessToken = null;
+  document.getElementById('authStatus').textContent = 'Not logged in';
+  document.getElementById('authOut').textContent = '';
+}
+
+async function createService() {
   const name = document.getElementById('svcName').value;
   const sesFrom = document.getElementById('svcSesFrom').value;
-  callApi('/admin/services', {
+  const result = await callApi('/admin/services', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ account_id: accountId, name, provider_type: 'ses', ses_from_email: sesFrom }),
+    body: JSON.stringify({ name, provider_type: 'ses', ses_from_email: sesFrom }),
   }, 'svcOut');
+  if (result) document.getElementById('keySvcId').value = result.service_id;
+}
+
+async function createApiKey() {
+  const svcId = document.getElementById('keySvcId').value.trim();
+  const origins = document.getElementById('keyOrigins').value.split(',').map(o => o.trim()).filter(Boolean);
+  const result = await callApi('/admin/services/' + encodeURIComponent(svcId) + '/keys', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ allowed_origins: origins }),
+  }, 'svcOut');
+  if (!result) return;
+  for (const id of ['sendApiKey', 'usageApiKey']) document.getElementById(id).value = result.api_key;
+  document.getElementById('sendSvcId').value = result.service_id;
 }
 
 function listServices() {
@@ -199,25 +274,21 @@ function listServices() {
 
 function domainPath(suffix) {
   const domain = document.getElementById('domName').value.trim();
-  const accountId = document.getElementById('domAcctId').value;
-  return '/admin/domains/' + encodeURIComponent(domain) + (suffix || '') + '?account_id=' + encodeURIComponent(accountId);
+  return '/admin/domains/' + encodeURIComponent(domain) + (suffix || '');
 }
 
 async function addDomain() {
   const result = await callApi('/admin/domains', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      account_id: document.getElementById('domAcctId').value,
-      domain: document.getElementById('domName').value.trim(),
-    }),
+    body: JSON.stringify({ domain: document.getElementById('domName').value.trim() }),
   }, 'domOut');
   if (result) showDomain(result);
 }
 
 function listDomains() {
   showDomain(null);
-  callApi('/admin/domains?account_id=' + encodeURIComponent(document.getElementById('domAcctId').value), {}, 'domOut');
+  callApi('/admin/domains', {}, 'domOut');
 }
 
 async function viewDomain() {

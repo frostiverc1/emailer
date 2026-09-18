@@ -1,5 +1,5 @@
 # --- domains Lambda: customer domain verification, behind the /admin/domains routes (main.tf) ---
-# Internal only like the admin routes: no auth yet, account_id comes from the request.
+# Same Cognito login as the admin routes; the account id comes from the token.
 
 data "aws_caller_identity" "current" {}
 

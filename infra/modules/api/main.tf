@@ -8,7 +8,7 @@ resource "aws_apigatewayv2_api" "this" {
   cors_configuration {
     allow_origins = ["*"]
     allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
-    allow_headers = ["content-type", "x-api-key"]
+    allow_headers = ["authorization", "content-type", "x-api-key"]
   }
 }
 
@@ -42,8 +42,7 @@ resource "aws_lambda_permission" "validate_invoke" {
   source_arn    = "${aws_apigatewayv2_api.this.execution_arn}/*/*"
 }
 
-# --- admin routes: internal only, no auth for the pilot per LLD section 1.
-# Not shared publicly; revisit before this API URL is ever handed to anyone outside the pilot. ---
+# --- admin routes: require a Cognito login (auth.tf). The Lambda scopes everything to the caller's account ---
 
 resource "aws_apigatewayv2_integration" "admin" {
   api_id                 = aws_apigatewayv2_api.this.id
@@ -54,10 +53,9 @@ resource "aws_apigatewayv2_integration" "admin" {
 
 locals {
   admin_routes = [
-    "POST /admin/accounts",
-    "GET /admin/accounts",
     "POST /admin/services",
     "GET /admin/services",
+    "POST /admin/services/{id}/keys",
     "GET /admin/templates",
     "POST /admin/templates",
     "GET /admin/templates/{id}",
@@ -73,6 +71,9 @@ resource "aws_apigatewayv2_route" "admin" {
   api_id    = aws_apigatewayv2_api.this.id
   route_key = each.value
   target    = "integrations/${aws_apigatewayv2_integration.admin.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
 resource "aws_lambda_permission" "admin_invoke" {
@@ -83,7 +84,7 @@ resource "aws_lambda_permission" "admin_invoke" {
   source_arn    = "${aws_apigatewayv2_api.this.execution_arn}/*/*"
 }
 
-# --- domain routes: same no-auth caveat as the admin routes above. The Lambda is in domains.tf ---
+# --- domain routes: same Cognito login as the admin routes above. The Lambda is in domains.tf ---
 
 resource "aws_apigatewayv2_integration" "domains" {
   api_id                 = aws_apigatewayv2_api.this.id
@@ -108,6 +109,9 @@ resource "aws_apigatewayv2_route" "domains" {
   api_id    = aws_apigatewayv2_api.this.id
   route_key = each.value
   target    = "integrations/${aws_apigatewayv2_integration.domains.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
 resource "aws_lambda_permission" "domains_invoke" {

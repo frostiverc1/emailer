@@ -17,25 +17,24 @@ def h(table):
         "VerifiedForSendingStatus": False,
         "DkimAttributes": {"Status": "PENDING", "Tokens": TOKENS, "SigningHostedZone": ZONE},
     }
-    for account_id in ("acct_a", "acct_b"):
-        table.put_item(Item={"PK": f"ACCT#{account_id}", "SK": "META", "name": account_id})
     return module
 
 
-def call(h, route, body=None, domain=None, account_id=None):
+def call(h, route, body=None, domain=None, account_id="acct_a"):
     event = {"routeKey": route}
     if body is not None:
         event["body"] = json.dumps(body)
     if domain is not None:
         event["pathParameters"] = {"domain": domain}
     if account_id is not None:
-        event["queryStringParameters"] = {"account_id": account_id}
+        # What the Cognito JWT authorizer passes on; the handler turns sub "a" into "acct_a".
+        event["requestContext"] = {"authorizer": {"jwt": {"claims": {"sub": account_id.removeprefix("acct_")}}}}
     resp = h.handler(event, None)
     return resp["statusCode"], (json.loads(resp["body"]) if resp["body"] else None)
 
 
 def add(h, domain, account_id="acct_a"):
-    return call(h, "POST /admin/domains", {"account_id": account_id, "domain": domain})
+    return call(h, "POST /admin/domains", {"domain": domain}, account_id=account_id)
 
 
 def client_error(code):
@@ -109,14 +108,15 @@ def test_invalid_domains_are_rejected(h, bad):
     h.sesv2.create_email_identity.assert_not_called()
 
 
-def test_missing_account_id(h):
-    assert call(h, "POST /admin/domains", {"domain": "acme.com"})[0] == 400
-
-
-def test_unknown_account(h):
-    status, body = add(h, "acme.com", account_id="acct_nope")
-    assert (status, body["error"]) == (404, "Account not found")
+def test_not_logged_in(h):
+    status, body = call(h, "POST /admin/domains", {"domain": "acme.com"}, account_id=None)
+    assert (status, body["error"]) == (401, "Unauthorized")
     h.sesv2.create_email_identity.assert_not_called()
+
+
+def test_account_id_in_body_is_ignored(h, table):
+    assert call(h, "POST /admin/domains", {"domain": "acme.com", "account_id": "acct_b"})[0] == 201
+    assert table.get_item(Key={"PK": "DOMAIN#acme.com", "SK": "META"})["Item"]["account_id"] == "acct_a"
 
 
 # --- ownership conflicts ---
@@ -219,10 +219,6 @@ def test_list_only_shows_own_domains(h):
     assert sorted(d["domain"] for d in body["domains"]) == ["acme.com", "acme.org"]
     assert all(d["status"] == "pending" for d in body["domains"])
     assert "records" not in body["domains"][0]
-
-
-def test_list_requires_account_id(h):
-    assert call(h, "GET /admin/domains")[0] == 400
 
 
 def test_get_own_domain_includes_records(h):

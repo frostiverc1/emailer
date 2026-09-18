@@ -33,7 +33,7 @@ def handler(event, context):
         return _resp(400, {"error": "Invalid JSON"})
 
     for field in ("service_id", "template_id", "template_params"):
-        if field not in body:
+        if not body.get(field):
             return _resp(400, {"error": f"Missing field: {field}"})
 
     to_email = body["template_params"].get("to_email")

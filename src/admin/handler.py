@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -9,11 +10,15 @@ from boto3.dynamodb.conditions import Key
 
 table = boto3.resource("dynamodb").Table(os.environ["OPS_TABLE_NAME"])
 
-# Internal-only Lambda, no auth for the pilot. Deploy behind a private stage /
-# VPC link / IAM auth, see docs/email-service-pilot-lld.md section 1.
+# Every route sits behind the Cognito JWT authorizer (infra/modules/api/auth.tf). The caller's
+# account is taken from the token, never from the request, and everything is scoped to it.
 
 
 def handler(event, context):
+    account_id = caller_account_id(event)
+    if not account_id:
+        return _resp(401, {"error": "Unauthorized"})
+
     route = event.get("routeKey", "")
     params = event.get("pathParameters") or {}
     qs = event.get("queryStringParameters") or {}
@@ -22,72 +27,55 @@ def handler(event, context):
     except json.JSONDecodeError:
         return _resp(400, {"error": "Invalid JSON"})
 
-    if route == "POST /admin/accounts":
-        return _create_account(body)
-    if route == "GET /admin/accounts":
-        return _list_accounts()
     if route == "POST /admin/services":
-        return _create_service(body)
+        return _create_service(account_id, body)
     if route == "GET /admin/services":
-        return _list_services()
+        return _list_services(account_id)
+    if route == "POST /admin/services/{id}/keys":
+        return _create_api_key(account_id, params.get("id"), body)
     if route == "GET /admin/templates":
-        return _list_templates(qs)
+        return _list_templates(account_id, qs)
     if route == "POST /admin/templates":
-        return _create_template(body)
+        return _create_template(account_id, body)
     if route == "GET /admin/templates/{id}":
-        return _get_template(params.get("id"), qs)
+        return _get_template(account_id, params.get("id"), qs)
     if route == "PUT /admin/templates/{id}":
-        return _update_template(params.get("id"), qs, body)
+        return _update_template(account_id, params.get("id"), qs, body)
     if route == "DELETE /admin/templates/{id}":
-        return _delete_template(params.get("id"), qs)
+        return _delete_template(account_id, params.get("id"), qs)
     if route == "GET /admin/usage/{api_key}":
-        return _get_usage(params.get("api_key"))
+        return _get_usage(account_id, params.get("api_key"))
     if route == "GET /admin/emails/{request_id}":
-        return _get_email(params.get("request_id"))
+        return _get_email(account_id, params.get("request_id"))
 
     return _resp(404, {"error": "Unknown route"})
 
 
-def _create_account(body):
-    if not body.get("name"):
-        return _resp(400, {"error": "Missing field: name"})
-
-    account_id = f"acct_{uuid.uuid4().hex[:16]}"
-    table.put_item(Item={
-        "PK": f"ACCT#{account_id}",
-        "SK": "META",
-        "name": body["name"],
-        "created_at": datetime.utcnow().isoformat(),
-    })
-    return _resp(201, {"account_id": account_id})
+def caller_account_id(event):
+    """The logged-in user's account. One account per Cognito user for now."""
+    claims = event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
+    return f"acct_{claims['sub']}" if claims.get("sub") else None
 
 
-def _list_accounts():
-    items = _scan_prefix("ACCT#", "META")
-    accounts = [{
-        "account_id": i["PK"].removeprefix("ACCT#"),
-        "name": i.get("name"),
-        "created_at": i.get("created_at"),
-    } for i in items]
-    return _resp(200, {"accounts": accounts})
+def _owns_service(account_id, service_id):
+    item = table.get_item(Key={"PK": f"SVC#{service_id}", "SK": "META"}).get("Item")
+    return bool(item) and item.get("account_id") == account_id
 
 
-def _create_service(body):
-    for field in ("account_id", "name", "provider_type"):
+def _create_service(account_id, body):
+    for field in ("name", "provider_type"):
         if field not in body:
             return _resp(400, {"error": f"Missing field: {field}"})
     if body["provider_type"] != "ses":
         return _resp(400, {"error": "Only provider_type=ses is supported in the pilot"})
     if not body.get("ses_from_email"):
         return _resp(400, {"error": "ses_from_email is required for provider_type=ses"})
-    if "Item" not in table.get_item(Key={"PK": f"ACCT#{body['account_id']}", "SK": "META"}):
-        return _resp(404, {"error": "Account not found"})
 
     service_id = f"svc_{uuid.uuid4().hex[:16]}"
     table.put_item(Item={
         "PK": f"SVC#{service_id}",
         "SK": "META",
-        "account_id": body["account_id"],
+        "account_id": account_id,
         "name": body["name"],
         "provider_type": "ses",
         "ses_from_email": body["ses_from_email"],
@@ -96,8 +84,8 @@ def _create_service(body):
     return _resp(201, {"service_id": service_id})
 
 
-def _list_services():
-    items = _scan_prefix("SVC#", "META")
+def _list_services(account_id):
+    items = [i for i in _scan_prefix("SVC#", "META") if i.get("account_id") == account_id]
     services = [{
         "service_id": i["PK"].removeprefix("SVC#"),
         "account_id": i.get("account_id"),
@@ -108,10 +96,36 @@ def _list_services():
     return _resp(200, {"services": services})
 
 
-def _list_templates(qs):
+def _create_api_key(account_id, service_id, body):
+    if not _owns_service(account_id, service_id):
+        return _resp(404, {"error": "Service not found"})
+    origins = body.get("allowed_origins") or []
+    if not isinstance(origins, list) or not all(isinstance(o, str) and o for o in origins):
+        return _resp(400, {"error": "allowed_origins must be a list of origins, e.g. [\"https://acme.com\"]"})
+
+    # Same plain APIKEY# row the validate Lambda reads today. docs/api-key-tiers.md has the hashed design.
+    api_key = f"gk_{secrets.token_hex(12)}"
+    item = {
+        "PK": f"APIKEY#{api_key}",
+        "SK": "META",
+        "service_id": service_id,
+        "daily_limit": 500,
+        "active": True,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    # No origins means any site can use the key. DynamoDB can't store an empty set, so leave it out.
+    if origins:
+        item["allowed_origins"] = set(origins)
+    table.put_item(Item=item)
+    return _resp(201, {"api_key": api_key, "service_id": service_id, "allowed_origins": origins})
+
+
+def _list_templates(account_id, qs):
     service_id = qs.get("service_id")
     if not service_id:
         return _resp(400, {"error": "service_id query param is required"})
+    if not _owns_service(account_id, service_id):
+        return _resp(404, {"error": "Service not found"})
 
     result = table.query(
         KeyConditionExpression=Key("PK").eq(f"SVC#{service_id}") & Key("SK").begins_with("TPL#"),
@@ -125,10 +139,12 @@ def _list_templates(qs):
     return _resp(200, {"templates": templates})
 
 
-def _create_template(body):
+def _create_template(account_id, body):
     for field in ("service_id", "template_id", "subject_tpl", "html_tpl"):
         if field not in body:
             return _resp(400, {"error": f"Missing field: {field}"})
+    if not _owns_service(account_id, body["service_id"]):
+        return _resp(404, {"error": "Service not found"})
 
     now = datetime.utcnow().isoformat()
     table.put_item(Item={
@@ -143,10 +159,12 @@ def _create_template(body):
     return _resp(201, {"template_id": body["template_id"]})
 
 
-def _get_template(template_id, qs):
+def _get_template(account_id, template_id, qs):
     service_id = qs.get("service_id")
     if not service_id or not template_id:
         return _resp(400, {"error": "service_id query param and template id are required"})
+    if not _owns_service(account_id, service_id):
+        return _resp(404, {"error": "Service not found"})
 
     result = table.get_item(Key={"PK": f"SVC#{service_id}", "SK": f"TPL#{template_id}"})
     item = result.get("Item")
@@ -162,10 +180,12 @@ def _get_template(template_id, qs):
     })
 
 
-def _update_template(template_id, qs, body):
+def _update_template(account_id, template_id, qs, body):
     service_id = qs.get("service_id")
     if not service_id or not template_id:
         return _resp(400, {"error": "service_id query param and template id are required"})
+    if not _owns_service(account_id, service_id):
+        return _resp(404, {"error": "Service not found"})
 
     existing = table.get_item(Key={"PK": f"SVC#{service_id}", "SK": f"TPL#{template_id}"})
     if "Item" not in existing:
@@ -184,18 +204,23 @@ def _update_template(template_id, qs, body):
     return _resp(200, {"template_id": template_id})
 
 
-def _delete_template(template_id, qs):
+def _delete_template(account_id, template_id, qs):
     service_id = qs.get("service_id")
     if not service_id or not template_id:
         return _resp(400, {"error": "service_id query param and template id are required"})
+    if not _owns_service(account_id, service_id):
+        return _resp(404, {"error": "Service not found"})
 
     table.delete_item(Key={"PK": f"SVC#{service_id}", "SK": f"TPL#{template_id}"})
     return _resp(204, None)
 
 
-def _get_usage(api_key):
+def _get_usage(account_id, api_key):
     if not api_key:
         return _resp(400, {"error": "api_key path param is required"})
+    key = table.get_item(Key={"PK": f"APIKEY#{api_key}", "SK": "META"}).get("Item")
+    if not key or not _owns_service(account_id, key.get("service_id")):
+        return _resp(404, {"error": "API key not found"})
 
     result = table.query(
         KeyConditionExpression=Key("PK").eq(f"USAGE#{api_key}") & Key("SK").begins_with("DAY#"),
@@ -207,12 +232,12 @@ def _get_usage(api_key):
     return _resp(200, {"api_key": api_key, "usage": days})
 
 
-def _get_email(request_id):
+def _get_email(account_id, request_id):
     if not request_id:
         return _resp(400, {"error": "request_id path param is required"})
 
     item = table.get_item(Key={"PK": f"EMAIL#{request_id}", "SK": "META"}).get("Item")
-    if not item:
+    if not item or not _owns_service(account_id, item.get("service_id")):
         return _resp(404, {"error": "Email not found"})
     return _resp(200, {
         "request_id": request_id,

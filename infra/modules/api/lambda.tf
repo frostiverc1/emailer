@@ -73,7 +73,7 @@ resource "aws_cloudwatch_log_group" "validate" {
   tags              = var.tags
 }
 
-# --- admin Lambda (internal only, no auth for pilot, protected by AWS_IAM route auth) ---
+# --- admin Lambda (behind the Cognito JWT authorizer, see auth.tf) ---
 
 data "archive_file" "admin" {
   type        = "zip"

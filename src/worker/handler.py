@@ -139,7 +139,9 @@ def _process(msg):
 
     # 3. render with Jinja2
     subject = Template(t["subject_tpl"]).render(**params)
-    html_body = Template(t["html_tpl"]).render(**params)
+    # Params come from end users (e.g. a website form), so they must not inject HTML. Subject and text
+    # are plain text and stay unescaped. A template can still opt out per value with | safe.
+    html_body = Template(t["html_tpl"], autoescape=True).render(**params)
     text_body = Template(t["text_tpl"]).render(**params) if t.get("text_tpl") else None
 
     # 4. send via SES, the only provider

@@ -16,7 +16,7 @@ table = boto3.resource("dynamodb").Table(os.environ["OPS_TABLE_NAME"])
 SES_REGION = os.environ.get("SES_REGION", "us-east-1")
 sesv2 = boto3.client("sesv2", region_name=SES_REGION)
 
-# Internal-only like the admin routes: account_id comes from the request until customer auth exists.
+# The API routes sit behind the Cognito JWT authorizer; the caller's account comes from the token.
 
 TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 # An unverified claim is released this long after it was first added, so nobody can hold a
@@ -44,39 +44,39 @@ def handler(event, context):
     if event.get("action") == "check_domains":
         return _check_domains(context)
 
+    # Same account id the admin Lambda derives, one account per Cognito user.
+    claims = event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
+    if not claims.get("sub"):
+        return _resp(401, {"error": "Unauthorized"})
+    account_id = f"acct_{claims['sub']}"
+
     route = event.get("routeKey", "")
     params = event.get("pathParameters") or {}
-    qs = event.get("queryStringParameters") or {}
     try:
         body = json.loads(event["body"]) if event.get("body") else {}
     except json.JSONDecodeError:
         return _resp(400, {"error": "Invalid JSON"})
 
     if route == "POST /admin/domains":
-        return _add_domain(body)
+        return _add_domain(account_id, body)
     if route == "GET /admin/domains":
-        return _list_domains(qs)
+        return _list_domains(account_id)
     if route == "GET /admin/domains/{domain}":
-        return _get_domain(params.get("domain"), qs)
+        return _get_domain(params.get("domain"), account_id)
     if route == "DELETE /admin/domains/{domain}":
-        return _delete_domain(params.get("domain"), qs)
+        return _delete_domain(params.get("domain"), account_id)
     if route == "POST /admin/domains/{domain}/check":
-        return _check_domain(params.get("domain"), qs)
+        return _check_domain(params.get("domain"), account_id)
     if route == "POST /admin/domains/{domain}/retry":
-        return _retry_domain(params.get("domain"), qs)
+        return _retry_domain(params.get("domain"), account_id)
 
     return _resp(404, {"error": "Unknown route"})
 
 
-def _add_domain(body):
-    account_id = body.get("account_id")
-    if not account_id:
-        return _resp(400, {"error": "Missing field: account_id"})
+def _add_domain(account_id, body):
     domain, error = _normalize_domain(body.get("domain"))
     if error:
         return _resp(400, {"error": error})
-    if "Item" not in table.get_item(Key={"PK": f"ACCT#{account_id}", "SK": "META"}):
-        return _resp(404, {"error": "Account not found"})
 
     conflict = _find_conflict(domain, account_id)
     if conflict:
@@ -151,11 +151,7 @@ def _add_domain(body):
     return _resp(201, _domain_view(item))
 
 
-def _list_domains(qs):
-    account_id = qs.get("account_id")
-    if not account_id:
-        return _resp(400, {"error": "account_id query param is required"})
-
+def _list_domains(account_id):
     domains = []
     for entry in _query_all(Key("PK").eq(f"ACCT#{account_id}") & Key("SK").begins_with("DOMAIN#")):
         item = table.get_item(Key={"PK": f"DOMAIN#{entry['domain']}", "SK": "META"}).get("Item")
@@ -164,15 +160,15 @@ def _list_domains(qs):
     return _resp(200, {"domains": domains})
 
 
-def _get_domain(raw_domain, qs):
-    item, error = _owned_domain(raw_domain, qs)
+def _get_domain(raw_domain, account_id):
+    item, error = _owned_domain(raw_domain, account_id)
     if error:
         return error
     return _resp(200, _domain_view(item))
 
 
-def _delete_domain(raw_domain, qs):
-    item, error = _owned_domain(raw_domain, qs)
+def _delete_domain(raw_domain, account_id):
+    item, error = _owned_domain(raw_domain, account_id)
     if error:
         return error
 
@@ -190,8 +186,8 @@ def _delete_domain(raw_domain, qs):
     return _resp(204, None)
 
 
-def _check_domain(raw_domain, qs):
-    item, error = _owned_domain(raw_domain, qs)
+def _check_domain(raw_domain, account_id):
+    item, error = _owned_domain(raw_domain, account_id)
     if error:
         return error
     if item.get("status") == "creating":
@@ -209,8 +205,8 @@ def _check_domain(raw_domain, qs):
     return _resp(200, _domain_view(item))
 
 
-def _retry_domain(raw_domain, qs):
-    item, error = _owned_domain(raw_domain, qs)
+def _retry_domain(raw_domain, account_id):
+    item, error = _owned_domain(raw_domain, account_id)
     if error:
         return error
 
@@ -369,10 +365,7 @@ def _refresh(item):
     return updated
 
 
-def _owned_domain(raw_domain, qs):
-    account_id = qs.get("account_id")
-    if not account_id:
-        return None, _resp(400, {"error": "account_id query param is required"})
+def _owned_domain(raw_domain, account_id):
     domain, error = _normalize_domain(raw_domain)
     if error:
         return None, _resp(400, {"error": error})
