@@ -53,15 +53,15 @@ resource "aws_apigatewayv2_integration" "admin" {
 
 locals {
   admin_routes = [
-    "POST /admin/services",
-    "GET /admin/services",
-    "POST /admin/services/{id}/keys",
+    "GET /admin/keys",
+    "POST /admin/keys",
     "GET /admin/templates",
     "POST /admin/templates",
     "GET /admin/templates/{id}",
     "PUT /admin/templates/{id}",
     "DELETE /admin/templates/{id}",
     "GET /admin/usage/{api_key}",
+    "GET /admin/emails",
     "GET /admin/emails/{request_id}",
   ]
 }

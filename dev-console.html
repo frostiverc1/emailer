@@ -25,14 +25,14 @@
 <body>
 
 <h1>Email service, dev console</h1>
-<p class="note">Local testing only. Talks to the deployed pilot API Gateway, not a local backend.</p>
+<p class="note">Local testing only. Talks to the deployed pilot API Gateway and Cognito, not a local backend. The config below is prefilled from <code>terraform output</code>. Change it after the AWS account move.</p>
 
 <section>
   <h2>Config</h2>
   <label>API base URL (API Gateway invoke URL)</label>
-  <input id="apiBase" placeholder="https://xxxx.execute-api.us-east-1.amazonaws.com">
+  <input id="apiBase" value="https://x3z4edjwve.execute-api.us-east-1.amazonaws.com/">
   <label>Cognito app client ID (terraform output user_pool_client_id)</label>
-  <input id="clientId" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxx">
+  <input id="clientId" value="7rfnbp0h69s7822h3rl98lt68n">
 </section>
 
 <section>
@@ -53,39 +53,18 @@
   <button onclick="confirmSignUp()">Confirm code</button>
   <button onclick="logIn()">Log in</button>
   <button onclick="logOut()">Log out</button>
-  <p class="note">Sign up, enter the emailed code and confirm, then log in. Everything below only shows your own services, templates and domains.</p>
+  <p class="note">Sign up, enter the emailed code and confirm, then log in. Everything below only shows your own templates and domains.</p>
   <div class="status" id="authStatus">Not logged in</div>
   <pre id="authOut"></pre>
 </section>
 
 <section>
-  <h2>Services</h2>
-  <div class="row">
-    <div>
-      <label>Name</label>
-      <input id="svcName" placeholder="Gencoft Internal">
-    </div>
-    <div>
-      <label>Verified SES from address</label>
-      <input id="svcSesFrom" placeholder="yourname@gencoft.com">
-    </div>
-  </div>
-  <p class="note">For the pilot, services use a verified SES address directly, no OAuth connect step. Verify the address in the SES console first.</p>
-  <button onclick="createService()">Create service</button>
-  <button onclick="listServices()">List services</button>
-  <div class="row">
-    <div>
-      <label>Service ID (for a new API key)</label>
-      <input id="keySvcId" placeholder="svc_xxx">
-    </div>
-    <div>
-      <label>Allowed origins (optional, comma separated)</label>
-      <input id="keyOrigins" placeholder="https://acme.com, http://localhost:3000">
-    </div>
-  </div>
+  <h2>API key</h2>
+  <label>Allowed origins (optional, comma separated)</label>
+  <input id="keyOrigins" placeholder="https://acme.com, http://localhost:3000">
   <button onclick="createApiKey()">Create API key</button>
-  <p class="note">Creating a service fills in its ID here. Leave origins empty to allow any site. The new key is filled into Send test email and Usage below.</p>
-  <pre id="svcOut"></pre>
+  <p class="note">A key belongs to your account and can send from any of your verified domains. Creating a new key turns the old one off. Leave origins empty to allow any site. The new key is filled into Send test email and Usage below.</p>
+  <pre id="keyOut"></pre>
 </section>
 
 <section>
@@ -109,8 +88,6 @@
 
 <section>
   <h2>Templates</h2>
-  <label>Service ID</label>
-  <input id="tplSvcId" placeholder="svc_xxx">
   <label>Template ID</label>
   <input id="tplId" placeholder="tpl_welcome">
   <label>Subject template</label>
@@ -120,11 +97,11 @@
   <label>Text body template (optional)</label>
   <textarea id="tplText" placeholder="Hello {{ to_name }}\n\n{{ message }}"></textarea>
   <button onclick="createTemplate()">Create template</button>
-  <button onclick="listTemplates()">List templates for this service</button>
+  <button onclick="listTemplates()">List templates</button>
   <button onclick="loadTemplate()">Load into form</button>
   <button onclick="updateTemplate()">Update template</button>
   <button onclick="deleteTemplate()">Delete template</button>
-  <p class="note">Load fills the fields above from the stored template. Update and Delete act on the Service ID / Template ID pair.</p>
+  <p class="note">Load fills the fields above from the stored template. Update and Delete act on the Template ID.</p>
   <pre id="tplOut"></pre>
 </section>
 
@@ -134,8 +111,8 @@
   <input id="sendApiKey" placeholder="gk_xxx">
   <div class="row">
     <div>
-      <label>Service ID</label>
-      <input id="sendSvcId" placeholder="svc_xxx">
+      <label>From address (must be on one of your verified domains)</label>
+      <input id="sendFrom" placeholder="no-reply@acme.com">
     </div>
     <div>
       <label>Template ID</label>
@@ -244,32 +221,15 @@ function logOut() {
   document.getElementById('authOut').textContent = '';
 }
 
-async function createService() {
-  const name = document.getElementById('svcName').value;
-  const sesFrom = document.getElementById('svcSesFrom').value;
-  const result = await callApi('/admin/services', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, provider_type: 'ses', ses_from_email: sesFrom }),
-  }, 'svcOut');
-  if (result) document.getElementById('keySvcId').value = result.service_id;
-}
-
 async function createApiKey() {
-  const svcId = document.getElementById('keySvcId').value.trim();
   const origins = document.getElementById('keyOrigins').value.split(',').map(o => o.trim()).filter(Boolean);
-  const result = await callApi('/admin/services/' + encodeURIComponent(svcId) + '/keys', {
+  const result = await callApi('/admin/keys', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ allowed_origins: origins }),
-  }, 'svcOut');
+  }, 'keyOut');
   if (!result) return;
   for (const id of ['sendApiKey', 'usageApiKey']) document.getElementById(id).value = result.api_key;
-  document.getElementById('sendSvcId').value = result.service_id;
-}
-
-function listServices() {
-  callApi('/admin/services', {}, 'svcOut');
 }
 
 function domainPath(suffix) {
@@ -335,7 +295,6 @@ function showDomain(d) {
 
 function createTemplate() {
   const body = {
-    service_id: document.getElementById('tplSvcId').value,
     template_id: document.getElementById('tplId').value,
     subject_tpl: document.getElementById('tplSubject').value,
     html_tpl: document.getElementById('tplHtml').value,
@@ -349,16 +308,12 @@ function createTemplate() {
 }
 
 function listTemplates() {
-  const svcId = document.getElementById('tplSvcId').value;
-  callApi('/admin/templates?service_id=' + encodeURIComponent(svcId), {}, 'tplOut');
+  callApi('/admin/templates', {}, 'tplOut');
 }
 
 async function loadTemplate() {
-  const svcId = document.getElementById('tplSvcId').value;
   const tplId = document.getElementById('tplId').value;
-  const tpl = await callApi(
-    '/admin/templates/' + encodeURIComponent(tplId) + '?service_id=' + encodeURIComponent(svcId),
-    {}, 'tplOut');
+  const tpl = await callApi('/admin/templates/' + encodeURIComponent(tplId), {}, 'tplOut');
   if (!tpl) return;
   document.getElementById('tplSubject').value = tpl.subject_tpl || '';
   document.getElementById('tplHtml').value = tpl.html_tpl || '';
@@ -366,14 +321,13 @@ async function loadTemplate() {
 }
 
 function updateTemplate() {
-  const svcId = document.getElementById('tplSvcId').value;
   const tplId = document.getElementById('tplId').value;
   const body = {
     subject_tpl: document.getElementById('tplSubject').value,
     html_tpl: document.getElementById('tplHtml').value,
     text_tpl: document.getElementById('tplText').value || undefined,
   };
-  callApi('/admin/templates/' + encodeURIComponent(tplId) + '?service_id=' + encodeURIComponent(svcId), {
+  callApi('/admin/templates/' + encodeURIComponent(tplId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -381,10 +335,9 @@ function updateTemplate() {
 }
 
 function deleteTemplate() {
-  const svcId = document.getElementById('tplSvcId').value;
   const tplId = document.getElementById('tplId').value;
-  if (!confirm('Delete template ' + tplId + ' from service ' + svcId + '?')) return;
-  callApi('/admin/templates/' + encodeURIComponent(tplId) + '?service_id=' + encodeURIComponent(svcId), {
+  if (!confirm('Delete template ' + tplId + '?')) return;
+  callApi('/admin/templates/' + encodeURIComponent(tplId), {
     method: 'DELETE',
   }, 'tplOut');
 }
@@ -408,7 +361,7 @@ async function sendTest() {
     return;
   }
   const body = {
-    service_id: document.getElementById('sendSvcId').value,
+    from_email: document.getElementById('sendFrom').value.trim(),
     template_id: document.getElementById('sendTplId').value,
     template_params: params,
   };

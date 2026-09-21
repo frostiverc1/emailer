@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import date, datetime, timezone
@@ -17,6 +18,8 @@ QUEUE_URL = os.environ["QUEUE_URL"]
 # Fixed width so the worker's lease check can compare timestamps as strings.
 TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 EMAIL_RECORD_TTL_SECONDS = 30 * 86400
+# A bare address only. Display names, angle brackets and lists are rejected so the domain check can't be sidestepped.
+FROM_EMAIL = re.compile(r"[^@\s<>,;\"]+@([A-Za-z0-9.-]+)")
 
 
 def handler(event, context):
@@ -32,7 +35,7 @@ def handler(event, context):
     except json.JSONDecodeError:
         return _resp(400, {"error": "Invalid JSON"})
 
-    for field in ("service_id", "template_id", "template_params"):
+    for field in ("from_email", "template_id", "template_params"):
         if not body.get(field):
             return _resp(400, {"error": f"Missing field: {field}"})
 
@@ -43,10 +46,10 @@ def handler(event, context):
     # --- 1. look up API key (ops table) ---
     key_record = ops_table.get_item(
         Key={"PK": f"APIKEY#{api_key}", "SK": "META"},
-        ProjectionExpression="service_id, allowed_origins, daily_limit, active",
+        ProjectionExpression="account_id, allowed_origins, daily_limit, active",
     )
     item = key_record.get("Item")
-    if not item or not item.get("active", False):
+    if not item or not item.get("active", False) or not item.get("account_id"):
         return _resp(401, {"error": "Invalid API key"})
 
     # --- 2. origin check ---
@@ -54,9 +57,10 @@ def handler(event, context):
     if allowed and origin and origin not in allowed:
         return _resp(403, {"error": "Origin not allowed"})
 
-    # --- 3. service_id must match key ---
-    if body["service_id"] != item["service_id"]:
-        return _resp(403, {"error": "API key not authorized for this service"})
+    # --- 3. from_email must be on a verified domain owned by the key's account ---
+    sender_error = _sender_error(body["from_email"], item["account_id"])
+    if sender_error:
+        return _resp(403, {"error": sender_error})
 
     # --- 4. daily quota (atomic increment, check after, ops table) ---
     today = date.today().isoformat()
@@ -77,19 +81,22 @@ def handler(event, context):
     # Written before the SQS message so the worker never sees a message without a record.
     request_id = str(uuid.uuid4())
     email_key = {"PK": f"EMAIL#{request_id}", "SK": "META"}
+    created_at = datetime.now(timezone.utc).strftime(TS_FORMAT)
+    expires_at = int(time.time()) + EMAIL_RECORD_TTL_SECONDS
     ops_table.put_item(
         Item={
             **email_key,
             "status": "queued",
-            "service_id": body["service_id"],
+            "account_id": item["account_id"],
             "template_id": body["template_id"],
             "to_email": to_email,
             "attempts": 0,
-            "created_at": datetime.now(timezone.utc).strftime(TS_FORMAT),
-            "ttl": int(time.time()) + EMAIL_RECORD_TTL_SECONDS,
+            "created_at": created_at,
+            "ttl": expires_at,
         },
         ConditionExpression="attribute_not_exists(PK)",
     )
+    _index_email(item["account_id"], request_id, created_at, expires_at)
 
     # --- 6. queue the job ---
     try:
@@ -98,7 +105,8 @@ def handler(event, context):
             MessageBody=json.dumps({
                 "request_id": request_id,
                 "api_key": api_key,
-                "service_id": body["service_id"],
+                "account_id": item["account_id"],
+                "from_email": body["from_email"],
                 "template_id": body["template_id"],
                 "template_params": body["template_params"],
                 "queued_at": datetime.utcnow().isoformat(),
@@ -110,6 +118,41 @@ def handler(event, context):
         return _resp(500, {"error": "Failed to queue email"})
 
     return _resp(202, {"status": "queued", "request_id": request_id})
+
+
+def _sender_error(from_email, account_id):
+    match = FROM_EMAIL.fullmatch(from_email) if isinstance(from_email, str) else None
+    if not match:
+        return "from_email must be a plain email address, e.g. hello@yourdomain.com"
+
+    domain = match.group(1).lower()
+    record = ops_table.get_item(
+        Key={"PK": f"DOMAIN#{domain}", "SK": "META"},
+        ProjectionExpression="account_id, #s",
+        ExpressionAttributeNames={"#s": "status"},
+    ).get("Item")
+    # Same message for "not added", "not verified yet" and "someone else's", so accounts can't probe each other.
+    if not record or record.get("account_id") != account_id or record.get("status") != "verified":
+        return f"{domain} is not a verified domain on this account"
+    return None
+
+
+def _index_email(account_id, request_id, created_at, expires_at):
+    """Lets the admin API list an account's emails newest first, without a scan or a GSI.
+
+    Best effort: the list is a convenience, so a failure here must never stop the email from being sent.
+    The row is a pointer only. The status lives on the EMAIL# record, which the worker updates.
+    """
+    try:
+        ops_table.put_item(Item={
+            "PK": f"ACCT#{account_id}",
+            # created_at is fixed-width UTC, so sorting by SK sorts by time.
+            "SK": f"EMAIL#{created_at}#{request_id}",
+            "request_id": request_id,
+            "ttl": expires_at,
+        })
+    except Exception:
+        logger.exception(f"Failed to index email for listing | request_id={request_id}")
 
 
 def _mark_queue_failed(email_key, exc):

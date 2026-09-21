@@ -2,11 +2,11 @@ import json
 import os
 import secrets
 import time
-import uuid
 from datetime import datetime, timedelta
 
 import boto3
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 table = boto3.resource("dynamodb").Table(os.environ["OPS_TABLE_NAME"])
 
@@ -27,24 +27,24 @@ def handler(event, context):
     except json.JSONDecodeError:
         return _resp(400, {"error": "Invalid JSON"})
 
-    if route == "POST /admin/services":
-        return _create_service(account_id, body)
-    if route == "GET /admin/services":
-        return _list_services(account_id)
-    if route == "POST /admin/services/{id}/keys":
-        return _create_api_key(account_id, params.get("id"), body)
+    if route == "GET /admin/keys":
+        return _get_current_key(account_id)
+    if route == "POST /admin/keys":
+        return _create_api_key(account_id, body)
     if route == "GET /admin/templates":
-        return _list_templates(account_id, qs)
+        return _list_templates(account_id)
     if route == "POST /admin/templates":
         return _create_template(account_id, body)
     if route == "GET /admin/templates/{id}":
-        return _get_template(account_id, params.get("id"), qs)
+        return _get_template(account_id, params.get("id"))
     if route == "PUT /admin/templates/{id}":
-        return _update_template(account_id, params.get("id"), qs, body)
+        return _update_template(account_id, params.get("id"), body)
     if route == "DELETE /admin/templates/{id}":
-        return _delete_template(account_id, params.get("id"), qs)
+        return _delete_template(account_id, params.get("id"))
     if route == "GET /admin/usage/{api_key}":
         return _get_usage(account_id, params.get("api_key"))
+    if route == "GET /admin/emails":
+        return _list_emails(account_id, qs)
     if route == "GET /admin/emails/{request_id}":
         return _get_email(account_id, params.get("request_id"))
 
@@ -57,58 +57,21 @@ def caller_account_id(event):
     return f"acct_{claims['sub']}" if claims.get("sub") else None
 
 
-def _owns_service(account_id, service_id):
-    item = table.get_item(Key={"PK": f"SVC#{service_id}", "SK": "META"}).get("Item")
-    return bool(item) and item.get("account_id") == account_id
-
-
-def _create_service(account_id, body):
-    for field in ("name", "provider_type"):
-        if field not in body:
-            return _resp(400, {"error": f"Missing field: {field}"})
-    if body["provider_type"] != "ses":
-        return _resp(400, {"error": "Only provider_type=ses is supported in the pilot"})
-    if not body.get("ses_from_email"):
-        return _resp(400, {"error": "ses_from_email is required for provider_type=ses"})
-
-    service_id = f"svc_{uuid.uuid4().hex[:16]}"
-    table.put_item(Item={
-        "PK": f"SVC#{service_id}",
-        "SK": "META",
-        "account_id": account_id,
-        "name": body["name"],
-        "provider_type": "ses",
-        "ses_from_email": body["ses_from_email"],
-        "oauth_status": "connected",
-    })
-    return _resp(201, {"service_id": service_id})
-
-
-def _list_services(account_id):
-    items = [i for i in _scan_prefix("SVC#", "META") if i.get("account_id") == account_id]
-    services = [{
-        "service_id": i["PK"].removeprefix("SVC#"),
-        "account_id": i.get("account_id"),
-        "name": i.get("name"),
-        "provider_type": i.get("provider_type"),
-        "ses_from_email": i.get("ses_from_email"),
-    } for i in items]
-    return _resp(200, {"services": services})
-
-
-def _create_api_key(account_id, service_id, body):
-    if not _owns_service(account_id, service_id):
-        return _resp(404, {"error": "Service not found"})
+def _create_api_key(account_id, body):
     origins = body.get("allowed_origins") or []
     if not isinstance(origins, list) or not all(isinstance(o, str) and o for o in origins):
         return _resp(400, {"error": "allowed_origins must be a list of origins, e.g. [\"https://acme.com\"]"})
+
+    # One key per account: creating a key turns the previous one off, so this doubles as rotation.
+    # ACCT#/CURRENT_KEY points at the live key, which avoids scanning for the account's keys.
+    _revoke_current_key(account_id)
 
     # Same plain APIKEY# row the validate Lambda reads today. docs/api-key-tiers.md has the hashed design.
     api_key = f"gk_{secrets.token_hex(12)}"
     item = {
         "PK": f"APIKEY#{api_key}",
         "SK": "META",
-        "service_id": service_id,
+        "account_id": account_id,
         "daily_limit": 500,
         "active": True,
         "created_at": datetime.utcnow().isoformat(),
@@ -117,18 +80,50 @@ def _create_api_key(account_id, service_id, body):
     if origins:
         item["allowed_origins"] = set(origins)
     table.put_item(Item=item)
-    return _resp(201, {"api_key": api_key, "service_id": service_id, "allowed_origins": origins})
+    table.put_item(Item={"PK": f"ACCT#{account_id}", "SK": "CURRENT_KEY", "api_key": api_key})
+    return _resp(201, {"api_key": api_key, "allowed_origins": origins})
 
 
-def _list_templates(account_id, qs):
-    service_id = qs.get("service_id")
-    if not service_id:
-        return _resp(400, {"error": "service_id query param is required"})
-    if not _owns_service(account_id, service_id):
-        return _resp(404, {"error": "Service not found"})
+def _get_current_key(account_id):
+    """The account's key as a masked hint. The full key is only ever returned once, when it's created."""
+    current = table.get_item(Key={"PK": f"ACCT#{account_id}", "SK": "CURRENT_KEY"}).get("Item")
+    key = current and table.get_item(Key={"PK": f"APIKEY#{current['api_key']}", "SK": "META"}).get("Item")
+    if not key or key.get("account_id") != account_id:
+        return _resp(200, {"key": None})
 
+    api_key = current["api_key"]
+    return _resp(200, {"key": {
+        "hint": f"{api_key[:3]}{'*' * 7}{api_key[-4:]}",
+        "active": bool(key.get("active")),
+        "created_at": key.get("created_at"),
+        "allowed_origins": sorted(key.get("allowed_origins", [])),
+    }})
+
+
+def _revoke_current_key(account_id):
+    current = table.get_item(Key={"PK": f"ACCT#{account_id}", "SK": "CURRENT_KEY"}).get("Item")
+    if not current:
+        return
+    try:
+        table.update_item(
+            Key={"PK": f"APIKEY#{current['api_key']}", "SK": "META"},
+            UpdateExpression="SET active = :off, revoked_at = :now",
+            # Never recreate a key row that was deleted by hand.
+            ConditionExpression="attribute_exists(PK)",
+            ExpressionAttributeValues={":off": False, ":now": datetime.utcnow().isoformat()},
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+
+
+def _template_key(account_id, template_id):
+    return {"PK": f"ACCT#{account_id}", "SK": f"TPL#{template_id}"}
+
+
+def _list_templates(account_id):
     result = table.query(
-        KeyConditionExpression=Key("PK").eq(f"SVC#{service_id}") & Key("SK").begins_with("TPL#"),
+        KeyConditionExpression=Key("PK").eq(f"ACCT#{account_id}") & Key("SK").begins_with("TPL#"),
     )
     templates = [{
         "template_id": i["SK"].removeprefix("TPL#"),
@@ -140,16 +135,13 @@ def _list_templates(account_id, qs):
 
 
 def _create_template(account_id, body):
-    for field in ("service_id", "template_id", "subject_tpl", "html_tpl"):
+    for field in ("template_id", "subject_tpl", "html_tpl"):
         if field not in body:
             return _resp(400, {"error": f"Missing field: {field}"})
-    if not _owns_service(account_id, body["service_id"]):
-        return _resp(404, {"error": "Service not found"})
 
     now = datetime.utcnow().isoformat()
     table.put_item(Item={
-        "PK": f"SVC#{body['service_id']}",
-        "SK": f"TPL#{body['template_id']}",
+        **_template_key(account_id, body["template_id"]),
         "subject_tpl": body["subject_tpl"],
         "html_tpl": body["html_tpl"],
         "text_tpl": body.get("text_tpl"),
@@ -159,15 +151,11 @@ def _create_template(account_id, body):
     return _resp(201, {"template_id": body["template_id"]})
 
 
-def _get_template(account_id, template_id, qs):
-    service_id = qs.get("service_id")
-    if not service_id or not template_id:
-        return _resp(400, {"error": "service_id query param and template id are required"})
-    if not _owns_service(account_id, service_id):
-        return _resp(404, {"error": "Service not found"})
+def _get_template(account_id, template_id):
+    if not template_id:
+        return _resp(400, {"error": "template id is required"})
 
-    result = table.get_item(Key={"PK": f"SVC#{service_id}", "SK": f"TPL#{template_id}"})
-    item = result.get("Item")
+    item = table.get_item(Key=_template_key(account_id, template_id)).get("Item")
     if not item:
         return _resp(404, {"error": "Template not found"})
     return _resp(200, {
@@ -180,19 +168,17 @@ def _get_template(account_id, template_id, qs):
     })
 
 
-def _update_template(account_id, template_id, qs, body):
-    service_id = qs.get("service_id")
-    if not service_id or not template_id:
-        return _resp(400, {"error": "service_id query param and template id are required"})
-    if not _owns_service(account_id, service_id):
-        return _resp(404, {"error": "Service not found"})
+def _update_template(account_id, template_id, body):
+    if not template_id:
+        return _resp(400, {"error": "template id is required"})
 
-    existing = table.get_item(Key={"PK": f"SVC#{service_id}", "SK": f"TPL#{template_id}"})
+    key = _template_key(account_id, template_id)
+    existing = table.get_item(Key=key)
     if "Item" not in existing:
         return _resp(404, {"error": "Template not found"})
 
     table.update_item(
-        Key={"PK": f"SVC#{service_id}", "SK": f"TPL#{template_id}"},
+        Key=key,
         UpdateExpression="SET subject_tpl = :s, html_tpl = :h, text_tpl = :t, updated_at = :u",
         ExpressionAttributeValues={
             ":s": body.get("subject_tpl", existing["Item"]["subject_tpl"]),
@@ -204,14 +190,11 @@ def _update_template(account_id, template_id, qs, body):
     return _resp(200, {"template_id": template_id})
 
 
-def _delete_template(account_id, template_id, qs):
-    service_id = qs.get("service_id")
-    if not service_id or not template_id:
-        return _resp(400, {"error": "service_id query param and template id are required"})
-    if not _owns_service(account_id, service_id):
-        return _resp(404, {"error": "Service not found"})
+def _delete_template(account_id, template_id):
+    if not template_id:
+        return _resp(400, {"error": "template id is required"})
 
-    table.delete_item(Key={"PK": f"SVC#{service_id}", "SK": f"TPL#{template_id}"})
+    table.delete_item(Key=_template_key(account_id, template_id))
     return _resp(204, None)
 
 
@@ -219,7 +202,7 @@ def _get_usage(account_id, api_key):
     if not api_key:
         return _resp(400, {"error": "api_key path param is required"})
     key = table.get_item(Key={"PK": f"APIKEY#{api_key}", "SK": "META"}).get("Item")
-    if not key or not _owns_service(account_id, key.get("service_id")):
+    if not key or key.get("account_id") != account_id:
         return _resp(404, {"error": "API key not found"})
 
     result = table.query(
@@ -232,17 +215,68 @@ def _get_usage(account_id, api_key):
     return _resp(200, {"api_key": api_key, "usage": days})
 
 
+DEFAULT_PAGE_SIZE = 25
+MAX_PAGE_SIZE = 50
+EMAIL_INDEX_PREFIX = "EMAIL#"
+
+
+def _list_emails(account_id, qs):
+    """The account's emails, newest first, one page at a time. Pass next_cursor back as ?cursor= for the next page."""
+    try:
+        limit = int(qs.get("limit") or DEFAULT_PAGE_SIZE)
+    except ValueError:
+        return _resp(400, {"error": "limit must be a number"})
+    limit = max(1, min(limit, MAX_PAGE_SIZE))
+
+    query = {
+        "KeyConditionExpression": Key("PK").eq(f"ACCT#{account_id}") & Key("SK").begins_with(EMAIL_INDEX_PREFIX),
+        "ScanIndexForward": False,
+        "Limit": limit,
+    }
+    cursor = qs.get("cursor")
+    if cursor:
+        # The cursor is just the last sort key we returned. The partition is always the caller's own.
+        if not cursor.startswith(EMAIL_INDEX_PREFIX):
+            return _resp(400, {"error": "Invalid cursor"})
+        query["ExclusiveStartKey"] = {"PK": f"ACCT#{account_id}", "SK": cursor}
+
+    page = table.query(**query)
+
+    emails = []
+    for entry in page.get("Items", []):
+        # Status lives on the email record, which the worker keeps up to date. A missing or foreign
+        # record (expired a moment before its index row, say) is skipped rather than shown wrong.
+        item = table.get_item(Key={"PK": f"EMAIL#{entry['request_id']}", "SK": "META"}).get("Item")
+        if item and item.get("account_id") == account_id:
+            emails.append(_email_summary(entry["request_id"], item))
+
+    last = page.get("LastEvaluatedKey")
+    return _resp(200, {"emails": emails, "next_cursor": last["SK"] if last else None})
+
+
+def _email_summary(request_id, item):
+    return {
+        "request_id": request_id,
+        "status": item.get("status"),
+        "template_id": item.get("template_id"),
+        "to_email": item.get("to_email"),
+        "created_at": item.get("created_at"),
+        "sent_at": item.get("sent_at"),
+        "failed_at": item.get("failed_at"),
+        "error_code": item.get("error_code"),
+    }
+
+
 def _get_email(account_id, request_id):
     if not request_id:
         return _resp(400, {"error": "request_id path param is required"})
 
     item = table.get_item(Key={"PK": f"EMAIL#{request_id}", "SK": "META"}).get("Item")
-    if not item or not _owns_service(account_id, item.get("service_id")):
+    if not item or item.get("account_id") != account_id:
         return _resp(404, {"error": "Email not found"})
     return _resp(200, {
         "request_id": request_id,
         "status": item.get("status"),
-        "service_id": item.get("service_id"),
         "template_id": item.get("template_id"),
         "to_email": item.get("to_email"),
         "attempts": int(item.get("attempts", 0)),
@@ -253,21 +287,6 @@ def _get_email(account_id, request_id):
         "error_code": item.get("error_code"),
         "error_message": item.get("error_message"),
     })
-
-
-def _scan_prefix(pk_prefix, sk_value):
-    items = []
-    kwargs = {}
-    while True:
-        page = table.scan(**kwargs)
-        items.extend(
-            i for i in page.get("Items", [])
-            if i["PK"].startswith(pk_prefix) and i["SK"] == sk_value
-        )
-        if "LastEvaluatedKey" not in page:
-            break
-        kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
-    return items
 
 
 def _resp(status, body):

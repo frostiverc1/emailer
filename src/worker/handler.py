@@ -109,27 +109,19 @@ def _claim(key, request_id):
 
 
 def _process(msg):
-    for field in ("api_key", "service_id", "template_id", "template_params"):
+    for field in ("api_key", "account_id", "from_email", "template_id", "template_params"):
         if field not in msg:
             raise PermanentError("INVALID_MESSAGE", f"Missing field: {field}")
     params = msg["template_params"]
     if not isinstance(params, dict) or not params.get("to_email"):
         raise PermanentError("INVALID_MESSAGE", "template_params.to_email is required")
 
-    svc_id = msg["service_id"]
     tpl_id = msg["template_id"]
     request_id = msg["request_id"]
 
-    # 1. fetch service config
-    svc = table.get_item(Key={"PK": f"SVC#{svc_id}", "SK": "META"})
-    if "Item" not in svc:
-        raise PermanentError("SERVICE_NOT_FOUND", f"Service not found: {svc_id}")
-
-    svc_full = svc["Item"]
-
-    # 2. fetch template
+    # 1. fetch template
     tpl = table.get_item(
-        Key={"PK": f"SVC#{svc_id}", "SK": f"TPL#{tpl_id}"},
+        Key={"PK": f"ACCT#{msg['account_id']}", "SK": f"TPL#{tpl_id}"},
         ProjectionExpression="subject_tpl, html_tpl, text_tpl",
     )
     if "Item" not in tpl:
@@ -137,24 +129,18 @@ def _process(msg):
 
     t = tpl["Item"]
 
-    # 3. render with Jinja2
+    # 2. render with Jinja2
     subject = Template(t["subject_tpl"]).render(**params)
     # Params come from end users (e.g. a website form), so they must not inject HTML. Subject and text
     # are plain text and stay unescaped. A template can still opt out per value with | safe.
     html_body = Template(t["html_tpl"], autoescape=True).render(**params)
     text_body = Template(t["text_tpl"]).render(**params) if t.get("text_tpl") else None
 
-    # 4. send via SES, the only provider
-    provider = svc_full.get("provider_type", "ses")
+    # 3. send via SES. validate already checked from_email is on one of the account's verified domains.
     to_email = params["to_email"]
+    message_id = _send_via_ses(msg["from_email"], to_email, subject, html_body, text_body, request_id, msg["api_key"])
 
-    if provider != "ses":
-        raise PermanentError("SERVICE_MISCONFIGURED", f"Unknown provider_type: {provider}")
-    if not svc_full.get("ses_from_email"):
-        raise PermanentError("SERVICE_MISCONFIGURED", f"Service {svc_id} has no ses_from_email")
-    message_id = _send_via_ses(svc_full["ses_from_email"], to_email, subject, html_body, text_body, request_id, msg["api_key"])
-
-    logger.info(f"Sent email | request_id={request_id} to={to_email} provider={provider}")
+    logger.info(f"Sent email | request_id={request_id} to={to_email}")
     return message_id
 
 
