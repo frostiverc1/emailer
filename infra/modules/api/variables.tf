@@ -24,8 +24,21 @@ variable "ses_region" {
   type        = string
 }
 
+variable "attachments_bucket_name" {
+  type = string
+}
+
+variable "attachments_bucket_arn" {
+  type = string
+}
+
 variable "tags" {
   description = "Common tags applied to all resources in this module"
   type        = map(string)
   default     = {}
+}
+
+variable "stripe_webhook_secret" {
+  description = "The secret used to verify Stripe webhook signatures"
+  type        = string
 }

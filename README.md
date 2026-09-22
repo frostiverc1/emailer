@@ -48,18 +48,31 @@ Content-Type: application/json
 {
   "from_email": "no-reply@acme.com",
   "template_id": "welcome",
-  "template_params": { "to_email": "someone@example.com", "to_name": "Sam" }
+  "template_params": { "to_email": "someone@example.com", "to_name": "Sam" },
+  "attachments": [{ "object_key": "users/acct_.../<uuid>_invoice.pdf", "filename": "invoice.pdf" }]
 }
 ```
+
+`attachments` is optional and, on plans that allow it, comes from `POST /v1/attachments/upload-url` below.
 
 | Status | Meaning |
 |---|---|
 | `202` | Queued. The body has `request_id`. Delivery happens afterwards. |
 | `400` | A field is missing: `from_email`, `template_id`, `template_params` or `template_params.to_email`. |
 | `401` | The key is missing, wrong, or was replaced by a newer one. |
-| `403` | The website isn't in the key's allowed websites, or `from_email` isn't a verified domain of the account. |
-| `429` | The key hit its daily limit. |
+| `403` | The website isn't in the key's allowed websites, `from_email` isn't a verified domain of the account, or an attachment isn't allowed on the plan, isn't this account's, is missing, or is over the plan's total. |
+| `429` | The key hit its plan's monthly request limit. |
 | `500` | The job couldn't be queued. |
+
+### Attachments: `POST /v1/attachments/upload-url`
+
+Same `x-api-key` header as `/v1/send`. Takes `{"filename": "invoice.pdf"}` and returns a presigned S3 upload, capped by the account's plan (`403` if the plan doesn't allow attachments):
+
+```
+{ "upload_url": "https://...", "fields": { ... }, "object_key": "users/acct_.../<uuid>_invoice.pdf" }
+```
+
+POST the file straight to `upload_url` with `fields` as form fields (S3 rejects anything over the plan's attachment size), then pass the returned `object_key` in `/v1/send`. Files are deleted right after the email sends (or fails for good); a 1-day bucket lifecycle rule is the backstop.
 
 ### Admin: `Authorization: Bearer <Cognito access token>`
 

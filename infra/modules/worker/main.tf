@@ -43,6 +43,12 @@ resource "aws_iam_role_policy" "worker" {
         Resource = var.queue_arn
       },
       {
+        # Fetches an email's attachments to send them, then deletes them once the send is done or gives up.
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:DeleteObject"]
+        Resource = "${var.attachments_bucket_arn}/users/*"
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "arn:aws:logs:*:*:*"
@@ -58,15 +64,19 @@ resource "aws_lambda_function" "worker" {
   handler          = "handler.handler"
   filename         = data.archive_file.worker.output_path
   source_code_hash = data.archive_file.worker.output_base64sha256
-  memory_size      = 256
-  timeout          = 60
-  layers           = [aws_lambda_layer_version.jinja2.arn]
+  # 256MB was enough before attachments; building the plan's largest attachment into a MIME
+  # message plus its ~33% base64 inflation needs more headroom, but not a lot: the total across
+  # one send's attachments is capped by the plan, so 512MB leaves comfortable margin.
+  memory_size = 512
+  timeout     = 60
+  layers      = [aws_lambda_layer_version.jinja2.arn]
 
   environment {
     variables = {
-      OPS_TABLE_NAME    = var.ops_table_name
-      SES_REGION        = var.ses_region
-      MAX_RECEIVE_COUNT = var.max_receive_count
+      OPS_TABLE_NAME          = var.ops_table_name
+      SES_REGION              = var.ses_region
+      MAX_RECEIVE_COUNT       = var.max_receive_count
+      ATTACHMENTS_BUCKET_NAME = var.attachments_bucket_name
       # Must exceed the Lambda timeout and stay below the queue visibility timeout.
       LEASE_SECONDS = 90
     }

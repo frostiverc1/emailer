@@ -30,6 +30,14 @@ variable "alarm_topic_arn" {
   type        = string
 }
 
+variable "attachments_bucket_name" {
+  type = string
+}
+
+variable "attachments_bucket_arn" {
+  type = string
+}
+
 variable "tags" {
   description = "Common tags applied to all resources in this module"
   type        = map(string)

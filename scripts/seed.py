@@ -19,6 +19,7 @@ table.put_item(Item={
     "PK": f"ACCT#{ACCOUNT_ID}",
     "SK": "META",
     "name": "Gencoft Internal",
+    "plan": "free",
     "created_at": "2024-01-01T00:00:00",
 })
 
@@ -27,7 +28,6 @@ table.put_item(Item={
     "SK": "META",
     "account_id": ACCOUNT_ID,
     "allowed_origins": set(ALLOWED_ORIGINS),
-    "daily_limit": 500,
     "active": True,
 })
 

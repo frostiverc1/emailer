@@ -10,6 +10,7 @@ from moto import mock_aws
 
 ROOT = Path(__file__).resolve().parent.parent
 TABLE_NAME = "emailer-ops-test"
+ATTACHMENTS_BUCKET = "emailer-attachments-test"
 
 # Fake credentials so nothing can ever reach a real AWS account.
 os.environ.update({
@@ -19,6 +20,7 @@ os.environ.update({
     "AWS_SESSION_TOKEN": "testing",
     "OPS_TABLE_NAME": TABLE_NAME,
     "SES_REGION": "us-east-1",
+    "ATTACHMENTS_BUCKET_NAME": ATTACHMENTS_BUCKET,
 })
 
 

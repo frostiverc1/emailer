@@ -39,6 +39,13 @@ resource "aws_iam_role_policy" "validate" {
         Resource = var.queue_arn
       },
       {
+        # PutObject is for signing presigned POSTs (validate never uploads bytes itself). GetObject
+        # is for HeadObject, checking an attachment's owner and size before an email is queued.
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:GetObject"]
+        Resource = "${var.attachments_bucket_arn}/users/*"
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "arn:aws:logs:*:*:*"
@@ -59,8 +66,9 @@ resource "aws_lambda_function" "validate" {
 
   environment {
     variables = {
-      OPS_TABLE_NAME = var.ops_table_name
-      QUEUE_URL      = var.queue_url
+      OPS_TABLE_NAME          = var.ops_table_name
+      QUEUE_URL               = var.queue_url
+      ATTACHMENTS_BUCKET_NAME = var.attachments_bucket_name
     }
   }
 
@@ -126,7 +134,8 @@ resource "aws_lambda_function" "admin" {
 
   environment {
     variables = {
-      OPS_TABLE_NAME = var.ops_table_name
+      OPS_TABLE_NAME        = var.ops_table_name
+      STRIPE_WEBHOOK_SECRET = var.stripe_webhook_secret
     }
   }
 

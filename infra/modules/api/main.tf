@@ -34,6 +34,12 @@ resource "aws_apigatewayv2_route" "send" {
   target    = "integrations/${aws_apigatewayv2_integration.validate.id}"
 }
 
+resource "aws_apigatewayv2_route" "attachments_upload_url" {
+  api_id    = aws_apigatewayv2_api.this.id
+  route_key = "POST /v1/attachments/upload-url"
+  target    = "integrations/${aws_apigatewayv2_integration.validate.id}"
+}
+
 resource "aws_lambda_permission" "validate_invoke" {
   statement_id  = "AllowAPIGatewayInvokeValidate"
   action        = "lambda:InvokeFunction"
@@ -63,6 +69,8 @@ locals {
     "GET /admin/usage/{api_key}",
     "GET /admin/emails",
     "GET /admin/emails/{request_id}",
+    "GET /admin/plan",
+    "POST /admin/plan",
   ]
 }
 
@@ -74,6 +82,13 @@ resource "aws_apigatewayv2_route" "admin" {
 
   authorization_type = "JWT"
   authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+# Webhook route is public (verifies its own signature)
+resource "aws_apigatewayv2_route" "stripe_webhook" {
+  api_id    = aws_apigatewayv2_api.this.id
+  route_key = "POST /v1/stripe-webhook"
+  target    = "integrations/${aws_apigatewayv2_integration.admin.id}"
 }
 
 resource "aws_lambda_permission" "admin_invoke" {

@@ -26,3 +26,9 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "stripe_webhook_secret" {
+  description = "The secret used to verify Stripe webhook signatures"
+  type        = string
+  sensitive   = true
+}

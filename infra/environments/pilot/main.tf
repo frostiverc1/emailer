@@ -19,24 +19,29 @@ module "email" {
 }
 
 module "worker" {
-  source            = "../../modules/worker"
-  name_prefix       = var.name_prefix
-  ops_table_name    = module.storage.ops_table_name
-  ops_table_arn     = module.storage.ops_table_arn
-  queue_arn         = module.queue.queue_arn
-  ses_region        = var.aws_region
-  max_receive_count = module.queue.max_receive_count
-  alarm_topic_arn   = module.queue.alarm_topic_arn
-  tags              = var.tags
+  source                  = "../../modules/worker"
+  name_prefix             = var.name_prefix
+  ops_table_name          = module.storage.ops_table_name
+  ops_table_arn           = module.storage.ops_table_arn
+  queue_arn               = module.queue.queue_arn
+  ses_region              = var.aws_region
+  max_receive_count       = module.queue.max_receive_count
+  alarm_topic_arn         = module.queue.alarm_topic_arn
+  attachments_bucket_name = module.storage.attachments_bucket_name
+  attachments_bucket_arn  = module.storage.attachments_bucket_arn
+  tags                    = var.tags
 }
 
 module "api" {
-  source         = "../../modules/api"
-  name_prefix    = var.name_prefix
-  ops_table_name = module.storage.ops_table_name
-  ops_table_arn  = module.storage.ops_table_arn
-  queue_url      = module.queue.queue_url
-  queue_arn      = module.queue.queue_arn
-  ses_region     = var.aws_region
-  tags           = var.tags
+  source                  = "../../modules/api"
+  name_prefix             = var.name_prefix
+  ops_table_name          = module.storage.ops_table_name
+  ops_table_arn           = module.storage.ops_table_arn
+  queue_url               = module.queue.queue_url
+  queue_arn               = module.queue.queue_arn
+  ses_region              = var.aws_region
+  attachments_bucket_name = module.storage.attachments_bucket_name
+  attachments_bucket_arn  = module.storage.attachments_bucket_arn
+  stripe_webhook_secret   = var.stripe_webhook_secret
+  tags                    = var.tags
 }

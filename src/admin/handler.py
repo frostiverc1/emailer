@@ -13,13 +13,78 @@ table = boto3.resource("dynamodb").Table(os.environ["OPS_TABLE_NAME"])
 # Every route sits behind the Cognito JWT authorizer (infra/modules/api/auth.tf). The caller's
 # account is taken from the token, never from the request, and everything is scoped to it.
 
+# No billing yet, so every account sits on "free" until a plan is set on its ACCT#/META row.
+# Kept in sync with the same table in src/validate/handler.py (each Lambda is packaged separately).
+DEFAULT_PLAN = "free"
+PLANS = {
+    "free":         {"price_usd": 0,  "requests_per_month": 200,   "templates": 2,    "attachment_bytes": 0,                "retention_days": 7},
+    "personal":     {"price_usd": 9,  "requests_per_month": 2000,  "templates": 6,    "attachment_bytes": 500 * 1024,       "retention_days": 30},
+    "professional": {"price_usd": 15, "requests_per_month": 5000,  "templates": None, "attachment_bytes": 2 * 1024 * 1024,  "retention_days": 30},
+    "business":     {"price_usd": 40, "requests_per_month": 25000, "templates": None, "attachment_bytes": 30 * 1024 * 1024, "retention_days": 30},
+}
+
+
+def _current_plan(account_id):
+    account = table.get_item(
+        Key={"PK": f"ACCT#{account_id}", "SK": "META"},
+        ProjectionExpression="#p", ExpressionAttributeNames={"#p": "plan"},
+    ).get("Item")
+    plan = (account or {}).get("plan", DEFAULT_PLAN)
+    return plan if plan in PLANS else DEFAULT_PLAN
+
+
+def _plan_limits(account_id):
+    return PLANS[_current_plan(account_id)]
+
+
+def _set_plan(account_id, body):
+    # No Stripe yet: picking a plan takes effect immediately, no payment collected.
+    plan = body.get("plan")
+    if plan not in PLANS:
+        return _resp(400, {"error": f"plan must be one of: {', '.join(PLANS)}"})
+    table.update_item(
+        Key={"PK": f"ACCT#{account_id}", "SK": "META"},
+        UpdateExpression="SET #p = :plan",
+        ExpressionAttributeNames={"#p": "plan"},
+        ExpressionAttributeValues={":plan": plan},
+    )
+    return _resp(200, _plan_snapshot(account_id))
+
+
+def _plan_snapshot(account_id):
+    plan = _current_plan(account_id)
+
+    current_key = table.get_item(Key={"PK": f"ACCT#{account_id}", "SK": "CURRENT_KEY"}).get("Item")
+    requests_this_month = 0
+    if current_key:
+        month = datetime.utcnow().strftime("%Y-%m")
+        usage = table.get_item(Key={"PK": f"USAGE#{current_key['api_key']}", "SK": f"MONTH#{month}"}).get("Item")
+        requests_this_month = int((usage or {}).get("count", 0))
+
+    templates_used = table.query(
+        KeyConditionExpression=Key("PK").eq(f"ACCT#{account_id}") & Key("SK").begins_with("TPL#"),
+        Select="COUNT",
+    )["Count"]
+
+    return {
+        "plan": plan,
+        "limits": PLANS[plan],
+        "usage": {"requests_this_month": requests_this_month, "templates_used": templates_used},
+        # The full catalog, so the frontend can show all plans without duplicating these numbers.
+        "catalog": PLANS,
+    }
+
 
 def handler(event, context):
+    route = event.get("routeKey", "")
+    
+    if route == "POST /v1/stripe-webhook":
+        return _stripe_webhook(event)
+
     account_id = caller_account_id(event)
     if not account_id:
         return _resp(401, {"error": "Unauthorized"})
 
-    route = event.get("routeKey", "")
     params = event.get("pathParameters") or {}
     qs = event.get("queryStringParameters") or {}
     try:
@@ -47,8 +112,85 @@ def handler(event, context):
         return _list_emails(account_id, qs)
     if route == "GET /admin/emails/{request_id}":
         return _get_email(account_id, params.get("request_id"))
+    if route == "GET /admin/plan":
+        return _resp(200, _plan_snapshot(account_id))
+    if route == "POST /admin/plan":
+        return _set_plan(account_id, body)
 
     return _resp(404, {"error": "Unknown route"})
+
+import hmac
+import hashlib
+
+def _stripe_webhook(event):
+    secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+    if not secret:
+        return _resp(500, {"error": "Webhook secret not configured"})
+
+    headers = {k.lower(): v for k, v in event.get("headers", {}).items()}
+    sig_header = headers.get("stripe-signature")
+    if not sig_header:
+        return _resp(400, {"error": "Missing signature"})
+
+    raw_body = event.get("body", "")
+    if event.get("isBase64Encoded"):
+        import base64
+        raw_body = base64.b64decode(raw_body).decode('utf-8')
+
+    try:
+        parts = dict(item.split('=') for item in sig_header.split(','))
+        timestamp = parts.get('t')
+        v1 = parts.get('v1')
+        if not timestamp or not v1:
+            return _resp(400, {"error": "Invalid signature format"})
+            
+        signed_payload = f"{timestamp}.{raw_body}"
+        mac = hmac.new(secret.encode('utf-8'), signed_payload.encode('utf-8'), hashlib.sha256)
+        expected_sig = mac.hexdigest()
+        if not hmac.compare_digest(expected_sig, v1):
+            return _resp(400, {"error": "Invalid signature"})
+    except Exception:
+        return _resp(400, {"error": "Invalid signature"})
+
+    try:
+        body = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "Invalid JSON"})
+
+    event_type = body.get("type")
+    data_obj = body.get("data", {}).get("object", {})
+
+    if event_type in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
+        account_id = data_obj.get("metadata", {}).get("account_id")
+        if not account_id:
+            return _resp(200, {"status": "ignored, missing account_id"})
+            
+        status = data_obj.get("status")
+        
+        if event_type != "customer.subscription.deleted" and status in ("active", "trialing"):
+            items = data_obj.get("items", {}).get("data", [])
+            plan = "free"
+            if items:
+                lookup_key = items[0].get("price", {}).get("lookup_key")
+                if lookup_key in PLANS:
+                    plan = lookup_key
+                    
+            table.update_item(
+                Key={"PK": f"ACCT#{account_id}", "SK": "META"},
+                UpdateExpression="SET #p = :plan",
+                ExpressionAttributeNames={"#p": "plan"},
+                ExpressionAttributeValues={":plan": plan},
+            )
+        else:
+            # canceled, unpaid, past_due, or deleted
+            table.update_item(
+                Key={"PK": f"ACCT#{account_id}", "SK": "META"},
+                UpdateExpression="SET #p = :plan",
+                ExpressionAttributeNames={"#p": "plan"},
+                ExpressionAttributeValues={":plan": "free"},
+            )
+
+    return _resp(200, {"status": "success"})
 
 
 def caller_account_id(event):
@@ -72,7 +214,6 @@ def _create_api_key(account_id, body):
         "PK": f"APIKEY#{api_key}",
         "SK": "META",
         "account_id": account_id,
-        "daily_limit": 500,
         "active": True,
         "created_at": datetime.utcnow().isoformat(),
     }
@@ -138,6 +279,18 @@ def _create_template(account_id, body):
     for field in ("template_id", "subject_tpl", "html_tpl"):
         if field not in body:
             return _resp(400, {"error": f"Missing field: {field}"})
+
+    # POST also updates an existing template_id, so the limit only applies to genuinely new ones.
+    is_new = "Item" not in table.get_item(Key=_template_key(account_id, body["template_id"]), ProjectionExpression="PK")
+    if is_new:
+        limit = _plan_limits(account_id)["templates"]
+        if limit is not None:
+            count = table.query(
+                KeyConditionExpression=Key("PK").eq(f"ACCT#{account_id}") & Key("SK").begins_with("TPL#"),
+                Select="COUNT",
+            )["Count"]
+            if count >= limit:
+                return _resp(403, {"error": f"Template limit reached for your plan ({limit})"})
 
     now = datetime.utcnow().isoformat()
     table.put_item(Item={
@@ -206,13 +359,13 @@ def _get_usage(account_id, api_key):
         return _resp(404, {"error": "API key not found"})
 
     result = table.query(
-        KeyConditionExpression=Key("PK").eq(f"USAGE#{api_key}") & Key("SK").begins_with("DAY#"),
+        KeyConditionExpression=Key("PK").eq(f"USAGE#{api_key}") & Key("SK").begins_with("MONTH#"),
     )
-    days = [{
-        "date": i["SK"].removeprefix("DAY#"),
+    months = [{
+        "month": i["SK"].removeprefix("MONTH#"),
         "count": int(i.get("count", 0)),
     } for i in result.get("Items", [])]
-    return _resp(200, {"api_key": api_key, "usage": days})
+    return _resp(200, {"api_key": api_key, "usage": months})
 
 
 DEFAULT_PAGE_SIZE = 25

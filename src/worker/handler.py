@@ -2,6 +2,9 @@ import json
 import os
 import logging
 from datetime import datetime, timedelta, timezone
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import boto3
 from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 from jinja2 import Template, TemplateSyntaxError
@@ -11,6 +14,10 @@ logger.setLevel(logging.INFO)
 
 table = boto3.resource("dynamodb").Table(os.environ["OPS_TABLE_NAME"])
 ses = boto3.client("ses", region_name=os.environ.get("SES_REGION", "us-east-1"))
+# Attachments need the v2 API: SendRawEmail (v1) caps a message at 10MB, sesv2 at 40MB.
+sesv2 = boto3.client("sesv2", region_name=os.environ.get("SES_REGION", "us-east-1"))
+s3 = boto3.client("s3")
+ATTACHMENTS_BUCKET = os.environ.get("ATTACHMENTS_BUCKET_NAME")
 
 MAX_RECEIVE_COUNT = int(os.environ["MAX_RECEIVE_COUNT"])
 LEASE_SECONDS = int(os.environ["LEASE_SECONDS"])
@@ -22,7 +29,9 @@ PERMANENT_SES_ERRORS = {
     "MailFromDomainNotVerifiedException": "SES_REJECTED",
     "ConfigurationSetDoesNotExist": "SES_REJECTED",
     "InvalidParameterValue": "SES_REJECTED",
-    "AccountSendingPausedException": "SES_ACCOUNT_PAUSED",
+    "AccountSendingPausedException": "SES_ACCOUNT_PAUSED",  # v1 (ses.send_email)
+    "AccountSuspendedException": "SES_ACCOUNT_PAUSED",      # v2 (sesv2.send_email, used for attachments)
+    "SendingPausedException": "SES_ACCOUNT_PAUSED",         # v2
 }
 TRANSIENT_SES_ERRORS = {"Throttling", "ServiceUnavailable", "InternalFailure"}
 TRANSIENT_DYNAMODB_ERRORS = {
@@ -70,11 +79,15 @@ def _handle_record(record):
             f"retryable={retryable} attempt={receive_count} error={exc}"
         )
         _record_error(key, request_id, "queued" if will_retry else "failed", error_code, exc)
+        if not will_retry:
+            # A retry still needs the attachment, so only clean up once nothing will try again.
+            _cleanup_attachments(msg.get("attachments"))
         if retryable:
             raise  # SQS redelivers, or moves the message to the DLQ on the last attempt
         return
 
     _mark_sent(key, request_id, message_id)
+    _cleanup_attachments(msg.get("attachments"))
 
 
 def _claim(key, request_id):
@@ -138,7 +151,8 @@ def _process(msg):
 
     # 3. send via SES. validate already checked from_email is on one of the account's verified domains.
     to_email = params["to_email"]
-    message_id = _send_via_ses(msg["from_email"], to_email, subject, html_body, text_body, request_id, msg["api_key"])
+    attachments = msg.get("attachments") or []
+    message_id = _send_via_ses(msg["from_email"], to_email, subject, html_body, text_body, request_id, msg["api_key"], attachments)
 
     logger.info(f"Sent email | request_id={request_id} to={to_email}")
     return message_id
@@ -201,15 +215,54 @@ def _mark_sent(key, request_id, message_id):
         logger.exception(f"Email sent but record not marked sent | request_id={request_id} ses_message_id={message_id}")
 
 
-def _send_via_ses(from_email, to_email, subject, html_body, text_body, request_id, api_key):
-    body_payload = {"Html": {"Data": html_body, "Charset": "UTF-8"}}
-    if text_body:
-        body_payload["Text"] = {"Data": text_body, "Charset": "UTF-8"}
-    response = ses.send_email(
-        Source=from_email,
+def _send_via_ses(from_email, to_email, subject, html_body, text_body, request_id, api_key, attachments):
+    if not attachments:
+        body_payload = {"Html": {"Data": html_body, "Charset": "UTF-8"}}
+        if text_body:
+            body_payload["Text"] = {"Data": text_body, "Charset": "UTF-8"}
+        response = ses.send_email(
+            Source=from_email,
+            Destination={"ToAddresses": [to_email]},
+            Message={"Subject": {"Data": subject, "Charset": "UTF-8"}, "Body": body_payload},
+            Tags=[{"Name": "request_id", "Value": request_id}, {"Name": "api_key", "Value": api_key}],
+        )
+        return response["MessageId"]
+
+    raw = _build_mime_message(from_email, to_email, subject, html_body, text_body, attachments)
+    response = sesv2.send_email(
+        FromEmailAddress=from_email,
         Destination={"ToAddresses": [to_email]},
-        Message={"Subject": {"Data": subject, "Charset": "UTF-8"}, "Body": body_payload},
-        Tags=[{"Name": "request_id", "Value": request_id}, {"Name": "api_key", "Value": api_key}],
+        Content={"Raw": {"Data": raw}},
+        EmailTags=[{"Name": "request_id", "Value": request_id}, {"Name": "api_key", "Value": api_key}],
     )
     return response["MessageId"]
+
+
+def _build_mime_message(from_email, to_email, subject, html_body, text_body, attachments):
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+
+    body = MIMEMultipart("alternative")
+    if text_body:
+        body.attach(MIMEText(text_body, "plain", "utf-8"))
+    body.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(body)
+
+    for attachment in attachments:
+        obj = s3.get_object(Bucket=ATTACHMENTS_BUCKET, Key=attachment["object_key"])
+        part = MIMEApplication(obj["Body"].read())
+        part.add_header("Content-Disposition", "attachment", filename=attachment["filename"])
+        msg.attach(part)
+
+    return msg.as_bytes()
+
+
+def _cleanup_attachments(attachments):
+    for attachment in attachments or []:
+        try:
+            s3.delete_object(Bucket=ATTACHMENTS_BUCKET, Key=attachment["object_key"])
+        except Exception:
+            logger.exception(f"Failed to delete attachment | object_key={attachment.get('object_key')}")
 
