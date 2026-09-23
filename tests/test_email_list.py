@@ -5,7 +5,7 @@ import pytest
 
 from conftest import load_handler
 
-KEY = "gk_test"
+KEY_ID = "test-key-id"
 
 
 @pytest.fixture
@@ -19,22 +19,24 @@ def validate(table, monkeypatch):
     module = load_handler("validate", table)
     module.ops_table = table
     module.sqs = mock.MagicMock()
-    table.put_item(Item={"PK": f"APIKEY#{KEY}", "SK": "META", "account_id": "acct_a", "active": True})
+    table.put_item(Item={"PK": f"APIKEYID#{KEY_ID}", "SK": "META", "account_id": "acct_a"})
     table.put_item(Item={"PK": "DOMAIN#acme.com", "SK": "META", "account_id": "acct_a", "status": "verified"})
     return module
 
 
 def send(validate, to="u@example.com"):
     body = {"from_email": "hi@acme.com", "template_id": "tpl_x", "template_params": {"to_email": to}}
-    resp = validate.handler({"headers": {"x-api-key": KEY}, "body": json.dumps(body)}, None)
+    event = {"httpMethod": "POST", "resource": "/v1/send", "requestContext": {"identity": {"apiKeyId": KEY_ID}}, "body": json.dumps(body)}
+    resp = validate.handler(event, None)
     assert resp["statusCode"] == 202
     return json.loads(resp["body"])["request_id"]
 
 
 def list_emails(admin, sub="a", **qs):
     event = {
-        "routeKey": "GET /admin/emails",
-        "requestContext": {"authorizer": {"jwt": {"claims": {"sub": sub}}}},
+        "httpMethod": "GET",
+        "resource": "/admin/emails",
+        "requestContext": {"authorizer": {"claims": {"sub": sub}}},
         "queryStringParameters": qs or None,
     }
     resp = admin.handler(event, None)
@@ -139,7 +141,7 @@ def test_index_row_pointing_at_someone_elses_record_is_skipped(admin, table):
 def test_other_rows_in_the_account_partition_are_not_listed(admin, table):
     table.put_item(Item={"PK": "ACCT#acct_a", "SK": "TPL#tpl_x", "subject_tpl": "Hi"})
     table.put_item(Item={"PK": "ACCT#acct_a", "SK": "DOMAIN#acme.com", "domain": "acme.com"})
-    table.put_item(Item={"PK": "ACCT#acct_a", "SK": "CURRENT_KEY", "api_key": "gk_x"})
+    table.put_item(Item={"PK": "ACCT#acct_a", "SK": "CURRENT_KEY", "api_key_id": "test-key-id"})
     assert list_emails(admin)[1] == {"emails": [], "next_cursor": None}
 
 
@@ -161,7 +163,7 @@ def test_limit_is_capped(admin, table):
 
 
 def test_not_logged_in(admin):
-    resp = admin.handler({"routeKey": "GET /admin/emails"}, None)
+    resp = admin.handler({"httpMethod": "GET", "resource": "/admin/emails"}, None)
     assert resp["statusCode"] == 401
 
 
@@ -183,9 +185,10 @@ def test_a_failing_index_write_does_not_stop_the_send(validate, table):
 
 def lookup(admin, request_id, sub):
     event = {
-        "routeKey": "GET /admin/emails/{request_id}",
+        "httpMethod": "GET",
+        "resource": "/admin/emails/{request_id}",
         "pathParameters": {"request_id": request_id},
-        "requestContext": {"authorizer": {"jwt": {"claims": {"sub": sub}}}},
+        "requestContext": {"authorizer": {"claims": {"sub": sub}}},
     }
     return admin.handler(event, None)
 

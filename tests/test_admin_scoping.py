@@ -11,16 +11,22 @@ def h(table):
 
 
 def call(h, route, body=None, sub="a", params=None):
-    event = {"routeKey": route}
+    method, resource = route.split(" ", 1)
+    event = {"httpMethod": method, "resource": resource}
     if sub is not None:
-        # What the Cognito JWT authorizer passes on.
-        event["requestContext"] = {"authorizer": {"jwt": {"claims": {"sub": sub}}}}
+        # What the Cognito authorizer passes on.
+        event["requestContext"] = {"authorizer": {"claims": {"sub": sub}}}
     if body is not None:
         event["body"] = json.dumps(body)
     if params is not None:
         event["pathParameters"] = params
     resp = h.handler(event, None)
     return resp["statusCode"], (json.loads(resp["body"]) if resp["body"] else None)
+
+
+def current_key_id(table, account="acct_a"):
+    item = table.get_item(Key={"PK": f"ACCT#{account}", "SK": "CURRENT_KEY"}).get("Item")
+    return item and item["api_key_id"]
 
 
 TEMPLATE = {"template_id": "tpl_x", "subject_tpl": "Hi", "html_tpl": "<p>Hi</p>"}
@@ -71,12 +77,6 @@ def test_cannot_delete_other_accounts_template(h, table):
     assert "Item" in table.get_item(Key={"PK": "ACCT#acct_b", "SK": "TPL#tpl_x"})
 
 
-def test_usage_only_for_own_keys(h, table):
-    table.put_item(Item={"PK": "APIKEY#gk_b", "SK": "META", "account_id": "acct_b"})
-    assert call(h, "GET /admin/usage/{api_key}", params={"api_key": "gk_b"})[0] == 404
-    assert call(h, "GET /admin/usage/{api_key}", params={"api_key": "gk_b"}, sub="b")[0] == 200
-
-
 def test_email_status_only_for_own_emails(h, table):
     table.put_item(Item={"PK": "EMAIL#r1", "SK": "META", "account_id": "acct_b", "status": "sent"})
     assert call(h, "GET /admin/emails/{request_id}", params={"request_id": "r1"})[0] == 404
@@ -86,47 +86,52 @@ def test_email_status_only_for_own_emails(h, table):
 def test_create_api_key_belongs_to_caller(h, table):
     status, body = call(h, "POST /admin/keys", {"allowed_origins": ["https://acme.com"], "account_id": "acct_b"})
     assert status == 201
-    assert body["api_key"].startswith("gk_")
-    stored = table.get_item(Key={"PK": f"APIKEY#{body['api_key']}", "SK": "META"})["Item"]
-    assert (stored["account_id"], stored["active"], stored["allowed_origins"]) == ("acct_a", True, {"https://acme.com"})
+    assert body["api_key"]
+    key_id = current_key_id(table, "acct_a")
+    stored = table.get_item(Key={"PK": f"APIKEYID#{key_id}", "SK": "META"})["Item"]
+    assert (stored["account_id"], stored["allowed_origins"]) == ("acct_a", {"https://acme.com"})
 
 
 def test_api_key_without_origins(h, table):
-    body = call(h, "POST /admin/keys")[1]
-    assert "allowed_origins" not in table.get_item(Key={"PK": f"APIKEY#{body['api_key']}", "SK": "META"})["Item"]
+    call(h, "POST /admin/keys")
+    key_id = current_key_id(table, "acct_a")
+    assert "allowed_origins" not in table.get_item(Key={"PK": f"APIKEYID#{key_id}", "SK": "META"})["Item"]
 
 
 def test_api_key_bad_origins(h):
     assert call(h, "POST /admin/keys", {"allowed_origins": "https://acme.com"})[0] == 400
 
 
-def key_row(table, api_key):
-    return table.get_item(Key={"PK": f"APIKEY#{api_key}", "SK": "META"}).get("Item")
-
-
 def test_new_key_revokes_the_previous_one(h, table):
-    first = call(h, "POST /admin/keys")[1]["api_key"]
-    second = call(h, "POST /admin/keys")[1]["api_key"]
-    assert first != second
-    assert key_row(table, first)["active"] is False
-    assert "revoked_at" in key_row(table, first)
-    assert key_row(table, second)["active"] is True
+    call(h, "POST /admin/keys")
+    first_id = current_key_id(table, "acct_a")
+    call(h, "POST /admin/keys")
+    second_id = current_key_id(table, "acct_a")
+    assert first_id != second_id
+    # The old key is gone from API Gateway entirely, not just flagged inactive.
+    with pytest.raises(h.ClientError):
+        h.apigw.get_api_key(apiKey=first_id)
+    h.apigw.get_api_key(apiKey=second_id)  # doesn't raise
 
 
 def test_rotation_leaves_other_accounts_keys_alone(h, table):
-    theirs = call(h, "POST /admin/keys", sub="b")[1]["api_key"]
+    call(h, "POST /admin/keys", sub="b")
+    their_id = current_key_id(table, "acct_b")
     call(h, "POST /admin/keys", sub="a")
     call(h, "POST /admin/keys", sub="a")
-    assert key_row(table, theirs)["active"] is True
+    got = h.apigw.get_api_key(apiKey=their_id)
+    assert got["enabled"] is True
 
 
-def test_rotation_when_old_key_row_is_gone(h, table):
-    first = call(h, "POST /admin/keys")[1]["api_key"]
-    table.delete_item(Key={"PK": f"APIKEY#{first}", "SK": "META"})
+def test_rotation_when_old_key_is_already_gone(h, table):
+    call(h, "POST /admin/keys")
+    first_id = current_key_id(table, "acct_a")
+    h.apigw.delete_api_key(apiKey=first_id)  # simulates it having disappeared already
     status, body = call(h, "POST /admin/keys")
     assert status == 201
-    assert key_row(table, first) is None
-    assert key_row(table, body["api_key"])["active"] is True
+    second_id = current_key_id(table, "acct_a")
+    assert second_id != first_id
+    h.apigw.get_api_key(apiKey=second_id)  # doesn't raise
 
 
 def test_no_key_yet(h):
@@ -138,7 +143,7 @@ def test_current_key_is_returned_masked(h):
     status, body = call(h, "GET /admin/keys")
     key = body["key"]
     assert status == 200
-    assert key["hint"] == f"gk_*******{created[-4:]}"
+    assert key["hint"] == f"{created[:3]}{'*' * 7}{created[-4:]}"
     assert (key["active"], key["allowed_origins"]) == (True, ["https://acme.com"])
     assert created not in json.dumps(body)
     assert created[3:-4] not in json.dumps(body)
@@ -155,11 +160,8 @@ def test_current_key_only_for_own_account(h):
     assert call(h, "GET /admin/keys", sub="a")[1] == {"key": None}
 
 
-def test_revoked_current_key_shows_inactive(h, table):
-    api_key = call(h, "POST /admin/keys")[1]["api_key"]
-    table.update_item(
-        Key={"PK": f"APIKEY#{api_key}", "SK": "META"},
-        UpdateExpression="SET active = :off",
-        ExpressionAttributeValues={":off": False},
-    )
+def test_disabled_current_key_shows_inactive(h, table):
+    call(h, "POST /admin/keys")
+    key_id = current_key_id(table, "acct_a")
+    h.apigw.update_api_key(apiKey=key_id, patchOperations=[{"op": "replace", "path": "/enabled", "value": "false"}])
     assert call(h, "GET /admin/keys")[1]["key"]["active"] is False

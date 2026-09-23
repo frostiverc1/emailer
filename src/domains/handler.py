@@ -45,12 +45,12 @@ def handler(event, context):
         return _check_domains(context)
 
     # Same account id the admin Lambda derives, one account per Cognito user.
-    claims = event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
+    claims = event.get("requestContext", {}).get("authorizer", {}).get("claims", {})
     if not claims.get("sub"):
         return _resp(401, {"error": "Unauthorized"})
     account_id = f"acct_{claims['sub']}"
 
-    route = event.get("routeKey", "")
+    route = f"{event.get('httpMethod')} {event.get('resource')}"
     params = event.get("pathParameters") or {}
     try:
         body = json.loads(event["body"]) if event.get("body") else {}
@@ -572,6 +572,9 @@ def _now():
 def _resp(status, body):
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+        },
         "body": json.dumps(body) if body is not None else "",
     }

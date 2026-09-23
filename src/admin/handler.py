@@ -1,16 +1,19 @@
 import json
+import logging
 import os
-import secrets
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
-table = boto3.resource("dynamodb").Table(os.environ["OPS_TABLE_NAME"])
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-# Every route sits behind the Cognito JWT authorizer (infra/modules/api/auth.tf). The caller's
+table = boto3.resource("dynamodb").Table(os.environ["OPS_TABLE_NAME"])
+apigw = boto3.client("apigateway")
+
+# Every admin route sits behind the Cognito authorizer (infra/modules/api/auth.tf). The caller's
 # account is taken from the token, never from the request, and everything is scoped to it.
 
 # No billing yet, so every account sits on "free" until a plan is set on its ACCT#/META row.
@@ -22,6 +25,21 @@ PLANS = {
     "professional": {"price_usd": 15, "requests_per_month": 5000,  "templates": None, "attachment_bytes": 2 * 1024 * 1024,  "retention_days": 30},
     "business":     {"price_usd": 40, "requests_per_month": 25000, "templates": None, "attachment_bytes": 30 * 1024 * 1024, "retention_days": 30},
 }
+
+# API Gateway usage plans are named "<this prefix><tier>" (infra/modules/api/main.tf). Looked up by
+# name and cached, rather than passed in as an env var, to avoid a Terraform dependency cycle
+# (the usage plans' api_stages block depends on the deployment, which depends on this Lambda).
+USAGE_PLAN_NAME_PREFIX = os.environ.get("USAGE_PLAN_NAME_PREFIX", "")
+_usage_plan_ids = {}
+
+
+def _usage_plan_id(plan):
+    if not _usage_plan_ids:
+        for up in apigw.get_usage_plans(limit=500).get("items", []):
+            name = up.get("name", "")
+            if name.startswith(USAGE_PLAN_NAME_PREFIX):
+                _usage_plan_ids[name[len(USAGE_PLAN_NAME_PREFIX):]] = up["id"]
+    return _usage_plan_ids.get(plan)
 
 
 def _current_plan(account_id):
@@ -37,8 +55,30 @@ def _plan_limits(account_id):
     return PLANS[_current_plan(account_id)]
 
 
+def _move_key_to_plan(account_id, new_plan):
+    """Moves the account's current API Gateway key onto the new plan's usage plan, if it has a key."""
+    current = table.get_item(Key={"PK": f"ACCT#{account_id}", "SK": "CURRENT_KEY"}).get("Item")
+    key_id = current and current.get("api_key_id")
+    if not key_id:
+        return
+    new_usage_plan_id = _usage_plan_id(new_plan)
+    if not new_usage_plan_id:
+        return
+    for up in apigw.get_usage_plans(limit=500).get("items", []):
+        if up.get("name", "").startswith(USAGE_PLAN_NAME_PREFIX) and up["id"] != new_usage_plan_id:
+            try:
+                apigw.delete_usage_plan_key(usagePlanId=up["id"], keyId=key_id)
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] != "NotFoundException":
+                    logger.exception(f"Failed to unlink key from old usage plan | key_id={key_id}")
+    try:
+        apigw.create_usage_plan_key(usagePlanId=new_usage_plan_id, keyId=key_id, keyType="API_KEY")
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConflictException":
+            raise
+
+
 def _set_plan(account_id, body):
-    # No Stripe yet: picking a plan takes effect immediately, no payment collected.
     plan = body.get("plan")
     if plan not in PLANS:
         return _resp(400, {"error": f"plan must be one of: {', '.join(PLANS)}"})
@@ -48,7 +88,24 @@ def _set_plan(account_id, body):
         ExpressionAttributeNames={"#p": "plan"},
         ExpressionAttributeValues={":plan": plan},
     )
+    _move_key_to_plan(account_id, plan)
     return _resp(200, _plan_snapshot(account_id))
+
+
+def _usage_this_month(usage_plan_id, key_id):
+    """Best effort: this is a display number, so a lookup failure just shows 0 instead of erroring."""
+    if not usage_plan_id or not key_id:
+        return 0
+    today = datetime.utcnow().date()
+    try:
+        usage = apigw.get_usage(
+            usagePlanId=usage_plan_id, keyId=key_id,
+            startDate=today.replace(day=1).isoformat(), endDate=today.isoformat(),
+        )
+        return sum(day[0] for day in usage.get("items", {}).get(key_id, []))
+    except Exception:
+        logger.exception(f"Failed to read usage | key_id={key_id}")
+        return 0
 
 
 def _plan_snapshot(account_id):
@@ -57,9 +114,7 @@ def _plan_snapshot(account_id):
     current_key = table.get_item(Key={"PK": f"ACCT#{account_id}", "SK": "CURRENT_KEY"}).get("Item")
     requests_this_month = 0
     if current_key:
-        month = datetime.utcnow().strftime("%Y-%m")
-        usage = table.get_item(Key={"PK": f"USAGE#{current_key['api_key']}", "SK": f"MONTH#{month}"}).get("Item")
-        requests_this_month = int((usage or {}).get("count", 0))
+        requests_this_month = _usage_this_month(_usage_plan_id(plan), current_key["api_key_id"])
 
     templates_used = table.query(
         KeyConditionExpression=Key("PK").eq(f"ACCT#{account_id}") & Key("SK").begins_with("TPL#"),
@@ -76,10 +131,7 @@ def _plan_snapshot(account_id):
 
 
 def handler(event, context):
-    route = event.get("routeKey", "")
-    
-    if route == "POST /v1/stripe-webhook":
-        return _stripe_webhook(event)
+    route = f"{event.get('httpMethod')} {event.get('resource')}"
 
     account_id = caller_account_id(event)
     if not account_id:
@@ -106,8 +158,6 @@ def handler(event, context):
         return _update_template(account_id, params.get("id"), body)
     if route == "DELETE /admin/templates/{id}":
         return _delete_template(account_id, params.get("id"))
-    if route == "GET /admin/usage/{api_key}":
-        return _get_usage(account_id, params.get("api_key"))
     if route == "GET /admin/emails":
         return _list_emails(account_id, qs)
     if route == "GET /admin/emails/{request_id}":
@@ -119,83 +169,10 @@ def handler(event, context):
 
     return _resp(404, {"error": "Unknown route"})
 
-import hmac
-import hashlib
-
-def _stripe_webhook(event):
-    secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
-    if not secret:
-        return _resp(500, {"error": "Webhook secret not configured"})
-
-    headers = {k.lower(): v for k, v in event.get("headers", {}).items()}
-    sig_header = headers.get("stripe-signature")
-    if not sig_header:
-        return _resp(400, {"error": "Missing signature"})
-
-    raw_body = event.get("body", "")
-    if event.get("isBase64Encoded"):
-        import base64
-        raw_body = base64.b64decode(raw_body).decode('utf-8')
-
-    try:
-        parts = dict(item.split('=') for item in sig_header.split(','))
-        timestamp = parts.get('t')
-        v1 = parts.get('v1')
-        if not timestamp or not v1:
-            return _resp(400, {"error": "Invalid signature format"})
-            
-        signed_payload = f"{timestamp}.{raw_body}"
-        mac = hmac.new(secret.encode('utf-8'), signed_payload.encode('utf-8'), hashlib.sha256)
-        expected_sig = mac.hexdigest()
-        if not hmac.compare_digest(expected_sig, v1):
-            return _resp(400, {"error": "Invalid signature"})
-    except Exception:
-        return _resp(400, {"error": "Invalid signature"})
-
-    try:
-        body = json.loads(raw_body)
-    except json.JSONDecodeError:
-        return _resp(400, {"error": "Invalid JSON"})
-
-    event_type = body.get("type")
-    data_obj = body.get("data", {}).get("object", {})
-
-    if event_type in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
-        account_id = data_obj.get("metadata", {}).get("account_id")
-        if not account_id:
-            return _resp(200, {"status": "ignored, missing account_id"})
-            
-        status = data_obj.get("status")
-        
-        if event_type != "customer.subscription.deleted" and status in ("active", "trialing"):
-            items = data_obj.get("items", {}).get("data", [])
-            plan = "free"
-            if items:
-                lookup_key = items[0].get("price", {}).get("lookup_key")
-                if lookup_key in PLANS:
-                    plan = lookup_key
-                    
-            table.update_item(
-                Key={"PK": f"ACCT#{account_id}", "SK": "META"},
-                UpdateExpression="SET #p = :plan",
-                ExpressionAttributeNames={"#p": "plan"},
-                ExpressionAttributeValues={":plan": plan},
-            )
-        else:
-            # canceled, unpaid, past_due, or deleted
-            table.update_item(
-                Key={"PK": f"ACCT#{account_id}", "SK": "META"},
-                UpdateExpression="SET #p = :plan",
-                ExpressionAttributeNames={"#p": "plan"},
-                ExpressionAttributeValues={":plan": "free"},
-            )
-
-    return _resp(200, {"status": "success"})
-
 
 def caller_account_id(event):
     """The logged-in user's account. One account per Cognito user for now."""
-    claims = event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
+    claims = event.get("requestContext", {}).get("authorizer", {}).get("claims", {})
     return f"acct_{claims['sub']}" if claims.get("sub") else None
 
 
@@ -208,53 +185,57 @@ def _create_api_key(account_id, body):
     # ACCT#/CURRENT_KEY points at the live key, which avoids scanning for the account's keys.
     _revoke_current_key(account_id)
 
-    # Same plain APIKEY# row the validate Lambda reads today. docs/api-key-tiers.md has the hashed design.
-    api_key = f"gk_{secrets.token_hex(12)}"
+    key = apigw.create_api_key(name=f"{account_id}", enabled=True)
+    usage_plan_id = _usage_plan_id(_current_plan(account_id))
+    if usage_plan_id:
+        apigw.create_usage_plan_key(usagePlanId=usage_plan_id, keyId=key["id"], keyType="API_KEY")
+
+    # Non-secret: only the key's id, which the request carries as requestContext.identity.apiKeyId.
+    # API Gateway holds the actual secret value; we never store it.
     item = {
-        "PK": f"APIKEY#{api_key}",
+        "PK": f"APIKEYID#{key['id']}",
         "SK": "META",
         "account_id": account_id,
-        "active": True,
         "created_at": datetime.utcnow().isoformat(),
     }
     # No origins means any site can use the key. DynamoDB can't store an empty set, so leave it out.
     if origins:
         item["allowed_origins"] = set(origins)
     table.put_item(Item=item)
-    table.put_item(Item={"PK": f"ACCT#{account_id}", "SK": "CURRENT_KEY", "api_key": api_key})
-    return _resp(201, {"api_key": api_key, "allowed_origins": origins})
+    table.put_item(Item={"PK": f"ACCT#{account_id}", "SK": "CURRENT_KEY", "api_key_id": key["id"]})
+    return _resp(201, {"api_key": key["value"], "allowed_origins": origins})
 
 
 def _get_current_key(account_id):
     """The account's key as a masked hint. The full key is only ever returned once, when it's created."""
     current = table.get_item(Key={"PK": f"ACCT#{account_id}", "SK": "CURRENT_KEY"}).get("Item")
-    key = current and table.get_item(Key={"PK": f"APIKEY#{current['api_key']}", "SK": "META"}).get("Item")
-    if not key or key.get("account_id") != account_id:
+    meta = current and table.get_item(Key={"PK": f"APIKEYID#{current.get('api_key_id')}", "SK": "META"}).get("Item")
+    if not meta or meta.get("account_id") != account_id:
         return _resp(200, {"key": None})
 
-    api_key = current["api_key"]
+    try:
+        gw_key = apigw.get_api_key(apiKey=current["api_key_id"], includeValue=True)
+    except ClientError:
+        return _resp(200, {"key": None})
+
+    value = gw_key.get("value", "")
     return _resp(200, {"key": {
-        "hint": f"{api_key[:3]}{'*' * 7}{api_key[-4:]}",
-        "active": bool(key.get("active")),
-        "created_at": key.get("created_at"),
-        "allowed_origins": sorted(key.get("allowed_origins", [])),
+        "hint": f"{value[:3]}{'*' * 7}{value[-4:]}" if len(value) > 7 else "*" * len(value),
+        "active": bool(gw_key.get("enabled")),
+        "created_at": meta.get("created_at"),
+        "allowed_origins": sorted(meta.get("allowed_origins", [])),
     }})
 
 
 def _revoke_current_key(account_id):
     current = table.get_item(Key={"PK": f"ACCT#{account_id}", "SK": "CURRENT_KEY"}).get("Item")
-    if not current:
+    key_id = current and current.get("api_key_id")
+    if not key_id:
         return
     try:
-        table.update_item(
-            Key={"PK": f"APIKEY#{current['api_key']}", "SK": "META"},
-            UpdateExpression="SET active = :off, revoked_at = :now",
-            # Never recreate a key row that was deleted by hand.
-            ConditionExpression="attribute_exists(PK)",
-            ExpressionAttributeValues={":off": False, ":now": datetime.utcnow().isoformat()},
-        )
+        apigw.delete_api_key(apiKey=key_id)
     except ClientError as exc:
-        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+        if exc.response["Error"]["Code"] != "NotFoundException":
             raise
 
 
@@ -351,23 +332,6 @@ def _delete_template(account_id, template_id):
     return _resp(204, None)
 
 
-def _get_usage(account_id, api_key):
-    if not api_key:
-        return _resp(400, {"error": "api_key path param is required"})
-    key = table.get_item(Key={"PK": f"APIKEY#{api_key}", "SK": "META"}).get("Item")
-    if not key or key.get("account_id") != account_id:
-        return _resp(404, {"error": "API key not found"})
-
-    result = table.query(
-        KeyConditionExpression=Key("PK").eq(f"USAGE#{api_key}") & Key("SK").begins_with("MONTH#"),
-    )
-    months = [{
-        "month": i["SK"].removeprefix("MONTH#"),
-        "count": int(i.get("count", 0)),
-    } for i in result.get("Items", [])]
-    return _resp(200, {"api_key": api_key, "usage": months})
-
-
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 50
 EMAIL_INDEX_PREFIX = "EMAIL#"
@@ -445,6 +409,9 @@ def _get_email(account_id, request_id):
 def _resp(status, body):
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+        },
         "body": json.dumps(body) if body is not None else "",
     }

@@ -5,7 +5,7 @@ import pytest
 
 from conftest import load_handler
 
-KEY = "gk_test"
+KEY_ID = "test-key-id"
 
 
 @pytest.fixture
@@ -14,15 +14,22 @@ def h(table, monkeypatch):
     module = load_handler("validate", table)
     module.ops_table = table
     module.sqs = mock.MagicMock()
-    table.put_item(Item={"PK": f"APIKEY#{KEY}", "SK": "META", "account_id": "acct_a", "active": True})
+    table.put_item(Item={"PK": f"APIKEYID#{KEY_ID}", "SK": "META", "account_id": "acct_a"})
     table.put_item(Item={"PK": "DOMAIN#acme.com", "SK": "META", "account_id": "acct_a", "status": "verified"})
     return module
 
 
-def send(h, **overrides):
+def send(h, api_key_id=KEY_ID, **overrides):
     body = {"from_email": "hi@acme.com", "template_id": "tpl_x", "template_params": {"to_email": "u@example.com"}}
     body.update(overrides)
-    resp = h.handler({"headers": {"x-api-key": KEY}, "body": json.dumps(body)}, None)
+    event = {
+        "httpMethod": "POST",
+        "resource": "/v1/send",
+        "headers": {},
+        "body": json.dumps(body),
+        "requestContext": {"identity": {"apiKeyId": api_key_id} if api_key_id else {}},
+    }
+    resp = h.handler(event, None)
     return resp["statusCode"], json.loads(resp["body"])
 
 
@@ -71,19 +78,14 @@ def test_domain_owned_by_another_account(h, table):
     h.sqs.send_message.assert_not_called()
 
 
-def test_key_without_account_is_rejected(h, table):
-    table.put_item(Item={"PK": "APIKEY#gk_old", "SK": "META", "service_id": "svc_old", "active": True})
-    resp = h.handler({"headers": {"x-api-key": "gk_old"}, "body": json.dumps({
-        "from_email": "hi@acme.com", "template_id": "t", "template_params": {"to_email": "u@example.com"},
-    })}, None)
-    assert resp["statusCode"] == 401
+def test_missing_api_key_id_is_rejected(h):
+    # API Gateway always sets this for a key-required route; a missing one means the event is malformed.
+    assert send(h, api_key_id=None)[0] == 401
+    h.sqs.send_message.assert_not_called()
 
 
-def test_revoked_key_is_rejected(h, table):
-    table.update_item(
-        Key={"PK": f"APIKEY#{KEY}", "SK": "META"},
-        UpdateExpression="SET active = :off",
-        ExpressionAttributeValues={":off": False},
-    )
-    assert send(h)[0] == 401
+def test_unknown_api_key_id_is_rejected(h):
+    # The key existed when API Gateway accepted the request but was deleted (e.g. replaced) before
+    # this Lambda ran. Rare, but validate should still refuse rather than guess the account.
+    assert send(h, api_key_id="deleted-key-id")[0] == 401
     h.sqs.send_message.assert_not_called()

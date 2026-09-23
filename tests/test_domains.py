@@ -21,14 +21,15 @@ def h(table):
 
 
 def call(h, route, body=None, domain=None, account_id="acct_a"):
-    event = {"routeKey": route}
+    method, resource = route.split(" ", 1)
+    event = {"httpMethod": method, "resource": resource}
     if body is not None:
         event["body"] = json.dumps(body)
     if domain is not None:
         event["pathParameters"] = {"domain": domain}
     if account_id is not None:
-        # What the Cognito JWT authorizer passes on; the handler turns sub "a" into "acct_a".
-        event["requestContext"] = {"authorizer": {"jwt": {"claims": {"sub": account_id.removeprefix("acct_")}}}}
+        # What the Cognito authorizer passes on; the handler turns sub "a" into "acct_a".
+        event["requestContext"] = {"authorizer": {"claims": {"sub": account_id.removeprefix("acct_")}}}
     resp = h.handler(event, None)
     return resp["statusCode"], (json.loads(resp["body"]) if resp["body"] else None)
 

@@ -39,6 +39,7 @@ variable "tags" {
 }
 
 variable "stripe_webhook_secret" {
-  description = "The secret used to verify Stripe webhook signatures"
+  description = "The secret used to verify Stripe webhook signatures. Unused while the stripe_webhook Lambda is commented out (lambda.tf)."
   type        = string
+  default     = ""
 }

@@ -2,8 +2,6 @@
 # The /admin/* routes (main.tf) require a Cognito access token. The Lambdas derive the caller's
 # account id from the token's sub, so one Cognito user is one account for now.
 
-data "aws_region" "current" {}
-
 resource "aws_cognito_user_pool" "customers" {
   name                     = "${var.name_prefix}-customers"
   username_attributes      = ["email"]
@@ -42,15 +40,9 @@ resource "aws_cognito_user_pool_client" "web" {
   prevent_user_existence_errors = "ENABLED"
 }
 
-resource "aws_apigatewayv2_authorizer" "cognito" {
-  api_id           = aws_apigatewayv2_api.this.id
-  name             = "${var.name_prefix}-cognito"
-  authorizer_type  = "JWT"
-  identity_sources = ["$request.header.Authorization"]
-
-  jwt_configuration {
-    # Access tokens carry client_id instead of aud; API Gateway checks either against this list.
-    audience = [aws_cognito_user_pool_client.web.id]
-    issuer   = "https://cognito-idp.${data.aws_region.current.name}.amazonaws.com/${aws_cognito_user_pool.customers.id}"
-  }
+resource "aws_api_gateway_authorizer" "cognito" {
+  name          = "${var.name_prefix}-cognito"
+  rest_api_id   = aws_api_gateway_rest_api.this.id
+  type          = "COGNITO_USER_POOLS"
+  provider_arns = [aws_cognito_user_pool.customers.arn]
 }

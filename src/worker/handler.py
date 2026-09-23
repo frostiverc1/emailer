@@ -122,7 +122,7 @@ def _claim(key, request_id):
 
 
 def _process(msg):
-    for field in ("api_key", "account_id", "from_email", "template_id", "template_params"):
+    for field in ("api_key_id", "account_id", "from_email", "template_id", "template_params"):
         if field not in msg:
             raise PermanentError("INVALID_MESSAGE", f"Missing field: {field}")
     params = msg["template_params"]
@@ -152,7 +152,7 @@ def _process(msg):
     # 3. send via SES. validate already checked from_email is on one of the account's verified domains.
     to_email = params["to_email"]
     attachments = msg.get("attachments") or []
-    message_id = _send_via_ses(msg["from_email"], to_email, subject, html_body, text_body, request_id, msg["api_key"], attachments)
+    message_id = _send_via_ses(msg["from_email"], to_email, subject, html_body, text_body, request_id, msg["api_key_id"], attachments)
 
     logger.info(f"Sent email | request_id={request_id} to={to_email}")
     return message_id
@@ -215,7 +215,7 @@ def _mark_sent(key, request_id, message_id):
         logger.exception(f"Email sent but record not marked sent | request_id={request_id} ses_message_id={message_id}")
 
 
-def _send_via_ses(from_email, to_email, subject, html_body, text_body, request_id, api_key, attachments):
+def _send_via_ses(from_email, to_email, subject, html_body, text_body, request_id, api_key_id, attachments):
     if not attachments:
         body_payload = {"Html": {"Data": html_body, "Charset": "UTF-8"}}
         if text_body:
@@ -224,7 +224,7 @@ def _send_via_ses(from_email, to_email, subject, html_body, text_body, request_i
             Source=from_email,
             Destination={"ToAddresses": [to_email]},
             Message={"Subject": {"Data": subject, "Charset": "UTF-8"}, "Body": body_payload},
-            Tags=[{"Name": "request_id", "Value": request_id}, {"Name": "api_key", "Value": api_key}],
+            Tags=[{"Name": "request_id", "Value": request_id}, {"Name": "api_key_id", "Value": api_key_id}],
         )
         return response["MessageId"]
 
@@ -233,7 +233,7 @@ def _send_via_ses(from_email, to_email, subject, html_body, text_body, request_i
         FromEmailAddress=from_email,
         Destination={"ToAddresses": [to_email]},
         Content={"Raw": {"Data": raw}},
-        EmailTags=[{"Name": "request_id", "Value": request_id}, {"Name": "api_key", "Value": api_key}],
+        EmailTags=[{"Name": "request_id", "Value": request_id}, {"Name": "api_key_id", "Value": api_key_id}],
     )
     return response["MessageId"]
 

@@ -21,6 +21,7 @@ os.environ.update({
     "OPS_TABLE_NAME": TABLE_NAME,
     "SES_REGION": "us-east-1",
     "ATTACHMENTS_BUCKET_NAME": ATTACHMENTS_BUCKET,
+    "USAGE_PLAN_NAME_PREFIX": "emailer-test-",
 })
 
 

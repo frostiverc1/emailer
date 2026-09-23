@@ -6,7 +6,7 @@ import pytest
 
 from conftest import ATTACHMENTS_BUCKET, load_handler
 
-KEY = "gk_test"
+KEY_ID = "test-key-id"
 
 
 @pytest.fixture
@@ -24,14 +24,19 @@ def v(table, bucket, monkeypatch):
     module = load_handler("validate", table)
     module.ops_table = table
     module.sqs = mock.MagicMock()
-    table.put_item(Item={"PK": f"APIKEY#{KEY}", "SK": "META", "account_id": "acct_a", "active": True})
+    table.put_item(Item={"PK": f"APIKEYID#{KEY_ID}", "SK": "META", "account_id": "acct_a"})
     table.put_item(Item={"PK": "DOMAIN#acme.com", "SK": "META", "account_id": "acct_a", "status": "verified"})
     return module
 
 
-def upload_url(v, api_key=KEY, **body_overrides):
+def upload_url(v, api_key_id=KEY_ID, **body_overrides):
     body = {"filename": "invoice.pdf", **body_overrides}
-    event = {"routeKey": "POST /v1/attachments/upload-url", "headers": ({"x-api-key": api_key} if api_key else {}), "body": json.dumps(body)}
+    event = {
+        "httpMethod": "POST",
+        "resource": "/v1/attachments/upload-url",
+        "requestContext": {"identity": {"apiKeyId": api_key_id} if api_key_id else {}},
+        "body": json.dumps(body),
+    }
     resp = v.handler(event, None)
     return resp["statusCode"], json.loads(resp["body"])
 
@@ -58,7 +63,7 @@ def test_upload_url_sanitizes_the_filename(v, table):
 
 
 def test_upload_url_requires_api_key(v):
-    assert upload_url(v, api_key=None)[0] == 401
+    assert upload_url(v, api_key_id=None)[0] == 401
 
 
 def test_upload_url_requires_filename(v, table):
@@ -72,7 +77,13 @@ def test_upload_url_requires_filename(v, table):
 def send(v, **overrides):
     body = {"from_email": "hi@acme.com", "template_id": "tpl_x", "template_params": {"to_email": "u@example.com"}}
     body.update(overrides)
-    resp = v.handler({"headers": {"x-api-key": KEY}, "body": json.dumps(body)}, None)
+    event = {
+        "httpMethod": "POST",
+        "resource": "/v1/send",
+        "requestContext": {"identity": {"apiKeyId": KEY_ID}},
+        "body": json.dumps(body),
+    }
+    resp = v.handler(event, None)
     return resp["statusCode"], json.loads(resp["body"])
 
 
@@ -146,7 +157,7 @@ def sqs_record(request_id, attempt=1):
 def make_message(request_id, attachments):
     return {
         "request_id": request_id,
-        "api_key": KEY,
+        "api_key_id": KEY_ID,
         "account_id": "acct_a",
         "from_email": "hi@acme.com",
         "template_id": "tpl_x",

@@ -2,9 +2,8 @@ import json
 import logging
 import os
 import re
-import time
 import uuid
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
@@ -27,6 +26,8 @@ SAFE_FILENAME = re.compile(r"[^A-Za-z0-9 ._-]")
 UPLOAD_URL_TTL_SECONDS = 15 * 60
 
 # No billing yet, so every account sits on "free" until a plan is set on its ACCT#/META row.
+# Monthly request quota isn't enforced here any more: API Gateway rejects an over-quota key
+# before this Lambda is even invoked, per the usage plan matching the account's plan (infra/modules/api).
 DEFAULT_PLAN = "free"
 PLANS = {
     "free":         {"price_usd": 0,  "requests_per_month": 200,   "templates": 2,    "attachment_bytes": 0,                "retention_days": 7},
@@ -37,18 +38,32 @@ PLANS = {
 
 
 def handler(event, context):
-    if event.get("routeKey") == "POST /v1/attachments/upload-url":
+    route = f"{event.get('httpMethod')} {event.get('resource')}"
+    if route == "POST /v1/attachments/upload-url":
         return _upload_url(event)
     return _send(event)
+
+
+def _caller(event):
+    """The API key's id (from API Gateway, which already validated the key and its quota) mapped
+    to the account it belongs to. Returns (account_id, allowed_origins) or None if unresolvable —
+    which should only happen for a key that was deleted after the request was already accepted."""
+    api_key_id = event.get("requestContext", {}).get("identity", {}).get("apiKeyId")
+    if not api_key_id:
+        return None
+    item = ops_table.get_item(
+        Key={"PK": f"APIKEYID#{api_key_id}", "SK": "META"},
+        ProjectionExpression="account_id, allowed_origins",
+    ).get("Item")
+    if not item or not item.get("account_id"):
+        return None
+    return item["account_id"], item.get("allowed_origins", set())
 
 
 def _send(event):
     # --- parse input ---
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
-    api_key = headers.get("x-api-key")
     origin = headers.get("origin", "")
-    if not api_key:
-        return _resp(401, {"error": "Missing API key"})
 
     try:
         body = json.loads(event.get("body") or "{}")
@@ -63,57 +78,39 @@ def _send(event):
     if not to_email:
         return _resp(400, {"error": "template_params.to_email is required"})
 
-    # --- 1. look up API key (ops table) ---
-    key_record = ops_table.get_item(
-        Key={"PK": f"APIKEY#{api_key}", "SK": "META"},
-        ProjectionExpression="account_id, allowed_origins, active",
-    )
-    item = key_record.get("Item")
-    if not item or not item.get("active", False) or not item.get("account_id"):
+    # --- 1. resolve the API key API Gateway already validated ---
+    caller = _caller(event)
+    if not caller:
         return _resp(401, {"error": "Invalid API key"})
+    account_id, allowed_origins = caller
+    api_key_id = event["requestContext"]["identity"]["apiKeyId"]
 
     # --- 2. origin check ---
-    allowed = item.get("allowed_origins", set())
-    if allowed and origin and origin not in allowed:
+    if allowed_origins and origin and origin not in allowed_origins:
         return _resp(403, {"error": "Origin not allowed"})
 
     # --- 3. from_email must be on a verified domain owned by the key's account ---
-    sender_error = _sender_error(body["from_email"], item["account_id"])
+    sender_error = _sender_error(body["from_email"], account_id)
     if sender_error:
         return _resp(403, {"error": sender_error})
 
     # --- 4. attachments, if any, must belong to this account and fit the plan's total ---
-    limits = _plan_limits(item["account_id"])
-    attachments, attachment_error = _validate_attachments(body.get("attachments"), item["account_id"], limits)
+    limits = _plan_limits(account_id)
+    attachments, attachment_error = _validate_attachments(body.get("attachments"), account_id, limits)
     if attachment_error:
         return _resp(403, {"error": attachment_error})
 
-    # --- 5. monthly quota, from the account's plan (atomic increment, check after, ops table) ---
-    month = date.today().strftime("%Y-%m")
-    usage = ops_table.update_item(
-        Key={"PK": f"USAGE#{api_key}", "SK": f"MONTH#{month}"},
-        UpdateExpression="ADD #c :inc SET #ttl = if_not_exists(#ttl, :ttl_val)",
-        ExpressionAttributeNames={"#c": "count", "#ttl": "ttl"},
-        ExpressionAttributeValues={
-            ":inc": 1,
-            ":ttl_val": int(time.time()) + 40 * 86400,
-        },
-        ReturnValues="UPDATED_NEW",
-    )
-    if int(usage["Attributes"]["count"]) > limits["requests_per_month"]:
-        return _resp(429, {"error": "Monthly quota exceeded"})
-
-    # --- 6. email record: status log, and the worker's idempotency gate ---
+    # --- 5. email record: status log, and the worker's idempotency gate ---
     # Written before the SQS message so the worker never sees a message without a record.
     request_id = str(uuid.uuid4())
     email_key = {"PK": f"EMAIL#{request_id}", "SK": "META"}
     created_at = datetime.now(timezone.utc).strftime(TS_FORMAT)
-    expires_at = int(time.time()) + limits["retention_days"] * 86400
+    expires_at = int(datetime.now(timezone.utc).timestamp()) + limits["retention_days"] * 86400
     ops_table.put_item(
         Item={
             **email_key,
             "status": "queued",
-            "account_id": item["account_id"],
+            "account_id": account_id,
             "template_id": body["template_id"],
             "to_email": to_email,
             "attempts": 0,
@@ -122,16 +119,16 @@ def _send(event):
         },
         ConditionExpression="attribute_not_exists(PK)",
     )
-    _index_email(item["account_id"], request_id, created_at, expires_at)
+    _index_email(account_id, request_id, created_at, expires_at)
 
-    # --- 7. queue the job ---
+    # --- 6. queue the job ---
     try:
         sqs.send_message(
             QueueUrl=QUEUE_URL,
             MessageBody=json.dumps({
                 "request_id": request_id,
-                "api_key": api_key,
-                "account_id": item["account_id"],
+                "api_key_id": api_key_id,
+                "account_id": account_id,
                 "from_email": body["from_email"],
                 "template_id": body["template_id"],
                 "template_params": body["template_params"],
@@ -166,10 +163,10 @@ def _sender_error(from_email, account_id):
 
 def _upload_url(event):
     """Issues a presigned S3 POST for one attachment, capped by the caller's plan."""
-    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
-    api_key = headers.get("x-api-key")
-    if not api_key:
-        return _resp(401, {"error": "Missing API key"})
+    caller = _caller(event)
+    if not caller:
+        return _resp(401, {"error": "Invalid API key"})
+    account_id, _allowed_origins = caller
 
     try:
         body = json.loads(event.get("body") or "{}")
@@ -180,22 +177,14 @@ def _upload_url(event):
     if not filename or not isinstance(filename, str):
         return _resp(400, {"error": "Missing field: filename"})
 
-    key_record = ops_table.get_item(
-        Key={"PK": f"APIKEY#{api_key}", "SK": "META"},
-        ProjectionExpression="account_id, active",
-    )
-    item = key_record.get("Item")
-    if not item or not item.get("active", False) or not item.get("account_id"):
-        return _resp(401, {"error": "Invalid API key"})
-
-    limits = _plan_limits(item["account_id"])
+    limits = _plan_limits(account_id)
     if limits["attachment_bytes"] == 0:
         return _resp(403, {"error": "Attachments are not available on your plan"})
 
     # Keeps the key free of path traversal and header-breaking characters; the object still
     # carries the real name via the `filename` field returned alongside it.
     safe_name = SAFE_FILENAME.sub("_", filename)[-100:] or "file"
-    object_key = f"users/{item['account_id']}/{uuid.uuid4()}_{safe_name}"
+    object_key = f"users/{account_id}/{uuid.uuid4()}_{safe_name}"
 
     post = s3.generate_presigned_post(
         Bucket=ATTACHMENTS_BUCKET,
