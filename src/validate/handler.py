@@ -78,6 +78,10 @@ def _send(event):
     if not to_email:
         return _resp(400, {"error": "template_params.to_email is required"})
 
+    reply_to = body.get("reply_to")
+    if reply_to and not FROM_EMAIL.fullmatch(reply_to):
+        return _resp(400, {"error": "reply_to must be a plain email address, e.g. visitor@example.com"})
+
     # --- 1. resolve the API key API Gateway already validated ---
     caller = _caller(event)
     if not caller:
@@ -130,6 +134,7 @@ def _send(event):
                 "api_key_id": api_key_id,
                 "account_id": account_id,
                 "from_email": body["from_email"],
+                "reply_to": reply_to,
                 "template_id": body["template_id"],
                 "template_params": body["template_params"],
                 "attachments": attachments,
