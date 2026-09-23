@@ -201,6 +201,13 @@ resource "aws_api_gateway_gateway_response" "cors" {
     "gatewayresponse.header.Access-Control-Allow-Origin"  = "'*'"
     "gatewayresponse.header.Access-Control-Allow-Headers" = "'authorization,content-type,x-api-key'"
   }
+
+  # response_templates isn't set here on purpose - we only manage the CORS headers above. AWS
+  # keeps a default template on these built-in responses, which otherwise diffs to null on every
+  # apply just because this resource doesn't mention it.
+  lifecycle {
+    ignore_changes = [response_templates]
+  }
 }
 
 resource "aws_api_gateway_deployment" "this" {

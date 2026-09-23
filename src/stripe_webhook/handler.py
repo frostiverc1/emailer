@@ -19,10 +19,10 @@ apigw = boto3.client("apigateway")
 # subscription-plan change actually needs: read/write the account's plan, and move its API key
 # between usage plans. Kept in sync with the same table in src/validate and src/admin handlers.
 PLANS = {
-    "free":         {"price_usd": 0,  "requests_per_month": 200,   "templates": 2,    "attachment_bytes": 0,                "retention_days": 7},
-    "personal":     {"price_usd": 9,  "requests_per_month": 2000,  "templates": 6,    "attachment_bytes": 500 * 1024,       "retention_days": 30},
-    "professional": {"price_usd": 15, "requests_per_month": 5000,  "templates": None, "attachment_bytes": 2 * 1024 * 1024,  "retention_days": 30},
-    "business":     {"price_usd": 40, "requests_per_month": 25000, "templates": None, "attachment_bytes": 30 * 1024 * 1024, "retention_days": 30},
+    "free":         {"price_usd": 0,  "requests_per_month": 200,   "templates": 2,    "attachment_bytes": 0,                "retention_days": 7,  "rate_limit": 2,  "burst_limit": 5},
+    "personal":     {"price_usd": 9,  "requests_per_month": 2000,  "templates": 6,    "attachment_bytes": 500 * 1024,       "retention_days": 30, "rate_limit": 5,  "burst_limit": 10},
+    "professional": {"price_usd": 15, "requests_per_month": 5000,  "templates": None, "attachment_bytes": 2 * 1024 * 1024,  "retention_days": 30, "rate_limit": 10, "burst_limit": 20},
+    "business":     {"price_usd": 40, "requests_per_month": 25000, "templates": None, "attachment_bytes": 25 * 1024 * 1024, "retention_days": 30, "rate_limit": 25, "burst_limit": 50},
 }
 
 # API Gateway usage plans are named "<this prefix><tier>" (infra/modules/api/main.tf).
