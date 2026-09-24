@@ -30,10 +30,10 @@
   <label for="apiKey">API key</label>
   <input id="apiKey" type="password" autocomplete="off" placeholder="paste your key here" />
 
-  <label for="fromEmail">from_email (a verified domain on your account)</label>
+  <label for="fromEmail">from (a verified domain on your account)</label>
   <input id="fromEmail" placeholder="no-reply@yourdomain.com" />
 
-  <label for="toEmail">to_email (your own inbox, where the enquiry should land)</label>
+  <label for="toEmail">to (your own inbox, where the enquiry should land)</label>
   <input id="toEmail" placeholder="you@yourdomain.com" />
 
   <label for="templateId">template_id (must have name / email / message variables)</label>
@@ -76,11 +76,11 @@ form.addEventListener("submit", async (e) => {
   resultEl.innerHTML = "";
 
   const payload = {
-    from_email: document.getElementById("fromEmail").value.trim(),
+    from: document.getElementById("fromEmail").value.trim(),
+    to: document.getElementById("toEmail").value.trim(),
     reply_to: document.getElementById("visitorEmail").value.trim(),
     template_id: document.getElementById("templateId").value.trim(),
     template_params: {
-      to_email: document.getElementById("toEmail").value.trim(),
       name: document.getElementById("visitorName").value.trim(),
       email: document.getElementById("visitorEmail").value.trim(),
       message: document.getElementById("visitorMessage").value.trim(),

@@ -20,7 +20,7 @@ Dashboard (Cognito login)                 │
 
 | Piece | What it does |
 |---|---|
-| `src/validate` | The public send endpoint. Checks the API key, the allowed websites, that the `from_email` domain is verified and owned by the key's account, and the daily limit. Then it writes the email record and queues the job. |
+| `src/validate` | The public send endpoint. Checks the API key, the allowed websites, that the `from` domain is verified and owned by the key's account, and the daily limit. Then it writes the email record and queues the job. |
 | `src/worker` | Takes jobs off the queue, renders the Jinja2 template, and sends through SES. Temporary failures are retried, and after 3 attempts a job goes to the dead-letter queue. |
 | `src/admin` | Login-protected routes for the API key, templates, and email status and history. |
 | `src/domains` | Login-protected routes to add and verify domains in SES. It also runs on a 15-minute schedule to re-check every domain. |
@@ -33,8 +33,8 @@ There is one DynamoDB table and no GSIs. The worker is not behind API Gateway. T
 - An **account** is one Cognito login (`acct_<token sub>`). Everything is scoped to it, and another account's data always looks like "not found".
 - An account can verify any number of **domains**. A domain is verified when its DKIM records check out in SES.
 - An account has **one API key**. Creating a new key turns the old one off. The full key is returned once, when it's created, and can't be read back. The key isn't tied to a domain or an address.
-- Every send names its own **`from_email`**. It must be a plain address (`hi@acme.com`, no display name) on a domain the account has verified. It's an exact match: `mail.acme.com` needs its own verification.
-- **Templates** belong to the account. They're Jinja2, with `to_email` as the only required parameter. The HTML body is auto-escaped, so a visitor's text can't inject markup.
+- Every send names its own **`from`**. It must be a plain address (`hi@acme.com`, no display name) on a domain the account has verified. It's an exact match: `mail.acme.com` needs its own verification.
+- **Templates** belong to the account. They're Jinja2, filled in from `template_params`, which holds only the values a template actually prints — the recipient (`to`) is a separate top-level field, not a template variable. The HTML body is auto-escaped, so a visitor's text can't inject markup.
 - Emails are kept for 30 days. Each key can send 500 a day.
 
 ## API
@@ -46,21 +46,35 @@ x-api-key: gk_...
 Content-Type: application/json
 
 {
-  "from_email": "no-reply@acme.com",
+  "from": "no-reply@acme.com",
+  "to": "someone@example.com",
+  "reply_to": "visitor@example.com",
   "template_id": "welcome",
-  "template_params": { "to_email": "someone@example.com", "to_name": "Sam" },
+  "template_params": { "to_name": "Sam" },
   "attachments": [{ "object_key": "users/acct_.../<uuid>_invoice.pdf", "filename": "invoice.pdf" }]
 }
 ```
 
+Three fields control where the email goes, and none of them are template variables:
+
+| Field | Meaning |
+|---|---|
+| `from` | The account's own sending address. Must be on a domain the account has verified. |
+| `to` | Who receives the email. Any address — it's the recipient, not something this account sends as. |
+| `reply_to` | Optional. Where a reply goes if the recipient hits "Reply". Defaults to `from` when omitted. Any address, doesn't need to be verified. |
+
+`template_params` holds only the values the template actually prints (`{{ to_name }}`, `{{ message }}`, etc.) — never routing fields like `to`.
+
 `attachments` is optional and, on plans that allow it, comes from `POST /v1/attachments/upload-url` below.
+
+The classic use of `reply_to` is a contact form: a visitor fills out a form on the account holder's website, the resulting email lands in the account holder's own inbox (`to`), and `reply_to` is set to the *visitor's* address (a field the visitor typed into the form) so the account holder can hit Reply and respond to them directly. `reply_to` never changes who receives the email — only where a reply to it goes.
 
 | Status | Meaning |
 |---|---|
 | `202` | Queued. The body has `request_id`. Delivery happens afterwards. |
-| `400` | A field is missing: `from_email`, `template_id`, `template_params` or `template_params.to_email`. |
+| `400` | A field is missing: `from`, `to`, `template_id` or `template_params`. Or `reply_to` isn't a plain email address. |
 | `401` | The key is missing, wrong, or was replaced by a newer one. |
-| `403` | The website isn't in the key's allowed websites, `from_email` isn't a verified domain of the account, or an attachment isn't allowed on the plan, isn't this account's, is missing, or is over the plan's total. |
+| `403` | The website isn't in the key's allowed websites, `from` isn't a verified domain of the account, or an attachment isn't allowed on the plan, isn't this account's, is missing, or is over the plan's total. |
 | `429` | The key hit its plan's monthly request limit. |
 | `500` | The job couldn't be queued. |
 

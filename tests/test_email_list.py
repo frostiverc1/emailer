@@ -25,7 +25,7 @@ def validate(table, monkeypatch):
 
 
 def send(validate, to="u@example.com"):
-    body = {"from_email": "hi@acme.com", "template_id": "tpl_x", "template_params": {"to_email": to}}
+    body = {"from": "hi@acme.com", "to": to, "template_id": "tpl_x", "template_params": {}}
     event = {"httpMethod": "POST", "resource": "/v1/send", "requestContext": {"identity": {"apiKeyId": KEY_ID}}, "body": json.dumps(body)}
     resp = validate.handler(event, None)
     assert resp["statusCode"] == 202

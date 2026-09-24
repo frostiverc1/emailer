@@ -122,15 +122,16 @@ def _claim(key, request_id):
 
 
 def _process(msg):
-    for field in ("api_key_id", "account_id", "from_email", "template_id", "template_params"):
+    for field in ("api_key_id", "account_id", "from", "to", "template_id", "template_params"):
         if field not in msg:
             raise PermanentError("INVALID_MESSAGE", f"Missing field: {field}")
     params = msg["template_params"]
-    if not isinstance(params, dict) or not params.get("to_email"):
-        raise PermanentError("INVALID_MESSAGE", "template_params.to_email is required")
+    if not isinstance(params, dict):
+        raise PermanentError("INVALID_MESSAGE", "template_params must be an object")
 
     tpl_id = msg["template_id"]
     request_id = msg["request_id"]
+    to_email = msg["to"]
 
     # 1. fetch template
     tpl = table.get_item(
@@ -149,11 +150,10 @@ def _process(msg):
     html_body = Template(t["html_tpl"], autoescape=True).render(**params)
     text_body = Template(t["text_tpl"]).render(**params) if t.get("text_tpl") else None
 
-    # 3. send via SES. validate already checked from_email is on one of the account's verified domains.
-    to_email = params["to_email"]
+    # 3. send via SES. validate already checked from is on one of the account's verified domains.
     attachments = msg.get("attachments") or []
     message_id = _send_via_ses(
-        msg["from_email"], to_email, subject, html_body, text_body, request_id, msg["api_key_id"], attachments,
+        msg["from"], to_email, subject, html_body, text_body, request_id, msg["api_key_id"], attachments,
         reply_to=msg.get("reply_to"),
     )
 

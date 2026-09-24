@@ -115,12 +115,22 @@
       <input id="sendFrom" placeholder="no-reply@acme.com">
     </div>
     <div>
+      <label>To address</label>
+      <input id="sendTo" placeholder="you@example.com">
+    </div>
+  </div>
+  <div class="row">
+    <div>
       <label>Template ID</label>
       <input id="sendTplId" placeholder="tpl_welcome">
     </div>
+    <div>
+      <label>Reply-to (optional)</label>
+      <input id="sendReplyTo" placeholder="visitor@example.com">
+    </div>
   </div>
-  <label>Template params (JSON, must include to_email)</label>
-  <textarea id="sendParams">{&#10;  "to_email": "you@example.com",&#10;  "to_name": "Test",&#10;  "message": "Hello from the dev console"&#10;}</textarea>
+  <label>Template params (JSON) — only the values the template prints, not the recipient</label>
+  <textarea id="sendParams">{&#10;  "to_name": "Test",&#10;  "message": "Hello from the dev console"&#10;}</textarea>
   <button onclick="sendTest()">Send test email</button>
   <pre id="sendOut"></pre>
 </section>
@@ -360,11 +370,14 @@ async function sendTest() {
     document.getElementById('sendOut').textContent = 'Invalid JSON in template params: ' + err.message;
     return;
   }
+  const replyTo = document.getElementById('sendReplyTo').value.trim();
   const body = {
-    from_email: document.getElementById('sendFrom').value.trim(),
+    from: document.getElementById('sendFrom').value.trim(),
+    to: document.getElementById('sendTo').value.trim(),
     template_id: document.getElementById('sendTplId').value,
     template_params: params,
   };
+  if (replyTo) body.reply_to = replyTo;
   const result = await callApi('/v1/send', {
     method: 'POST',
     headers: {

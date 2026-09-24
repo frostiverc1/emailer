@@ -101,7 +101,7 @@ def v(table, monkeypatch):
 
 
 def send(v):
-    body = {"from_email": "hi@acme.com", "template_id": "tpl_x", "template_params": {"to_email": "u@example.com"}}
+    body = {"from": "hi@acme.com", "to": "u@example.com", "template_id": "tpl_x", "template_params": {}}
     event = {
         "httpMethod": "POST",
         "resource": "/v1/send",

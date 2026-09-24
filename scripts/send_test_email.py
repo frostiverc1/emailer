@@ -8,10 +8,10 @@ response = requests.post(
     "https://l2ej48431a.execute-api.us-east-1.amazonaws.com/dev/v1/send",
     headers={"x-api-key": os.environ["EMAILER_API_KEY"]},
     json={
-        "from_email": "no-reply@brandflyers.com",
+        "from": "no-reply@brandflyers.com",
+        "to": "akhileshss991@gmail.com",
         "template_id": "order-confirmation",
         "template_params": {
-            "to_email": "akhileshss991@gmail.com",
             "order_number": "BF-10882",
             "delivery_date": "28 Sep 2026",
             "order_url": "https://brandflyers.com/orders/1042",

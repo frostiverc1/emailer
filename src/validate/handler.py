@@ -70,13 +70,12 @@ def _send(event):
     except json.JSONDecodeError:
         return _resp(400, {"error": "Invalid JSON"})
 
-    for field in ("from_email", "template_id", "template_params"):
+    for field in ("from", "to", "template_id"):
         if not body.get(field):
             return _resp(400, {"error": f"Missing field: {field}"})
-
-    to_email = body["template_params"].get("to_email")
-    if not to_email:
-        return _resp(400, {"error": "template_params.to_email is required"})
+    # A dict check, not a truthiness check: {} is a valid template_params for a template with no variables.
+    if not isinstance(body.get("template_params"), dict):
+        return _resp(400, {"error": "Missing field: template_params"})
 
     reply_to = body.get("reply_to")
     if reply_to and not FROM_EMAIL.fullmatch(reply_to):
@@ -93,8 +92,8 @@ def _send(event):
     if allowed_origins and origin and origin not in allowed_origins:
         return _resp(403, {"error": "Origin not allowed"})
 
-    # --- 3. from_email must be on a verified domain owned by the key's account ---
-    sender_error = _sender_error(body["from_email"], account_id)
+    # --- 3. from must be on a verified domain owned by the key's account ---
+    sender_error = _sender_error(body["from"], account_id)
     if sender_error:
         return _resp(403, {"error": sender_error})
 
@@ -116,7 +115,7 @@ def _send(event):
             "status": "queued",
             "account_id": account_id,
             "template_id": body["template_id"],
-            "to_email": to_email,
+            "to_email": body["to"],
             "attempts": 0,
             "created_at": created_at,
             "ttl": expires_at,
@@ -133,7 +132,8 @@ def _send(event):
                 "request_id": request_id,
                 "api_key_id": api_key_id,
                 "account_id": account_id,
-                "from_email": body["from_email"],
+                "from": body["from"],
+                "to": body["to"],
                 "reply_to": reply_to,
                 "template_id": body["template_id"],
                 "template_params": body["template_params"],
@@ -152,7 +152,7 @@ def _send(event):
 def _sender_error(from_email, account_id):
     match = FROM_EMAIL.fullmatch(from_email) if isinstance(from_email, str) else None
     if not match:
-        return "from_email must be a plain email address, e.g. hello@yourdomain.com"
+        return "from must be a plain email address, e.g. hello@yourdomain.com"
 
     domain = match.group(1).lower()
     record = ops_table.get_item(

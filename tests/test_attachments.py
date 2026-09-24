@@ -75,7 +75,7 @@ def test_upload_url_requires_filename(v, table):
 # --- validate: POST /v1/send with attachments ---
 
 def send(v, **overrides):
-    body = {"from_email": "hi@acme.com", "template_id": "tpl_x", "template_params": {"to_email": "u@example.com"}}
+    body = {"from": "hi@acme.com", "to": "u@example.com", "template_id": "tpl_x", "template_params": {}}
     body.update(overrides)
     event = {
         "httpMethod": "POST",
@@ -141,7 +141,7 @@ def w(table, bucket, monkeypatch):
     monkeypatch.setenv("LEASE_SECONDS", "90")
     module = load_handler("worker", table)
     module.table = table
-    module.ses = mock.MagicMock()
+    module.ses = mock.MagicMock(**{"send_email.return_value": {"MessageId": "msg-0"}})
     module.sesv2 = mock.MagicMock(**{"send_email.return_value": {"MessageId": "msg-1"}})
     table.put_item(Item={
         "PK": "ACCT#acct_a", "SK": "TPL#tpl_x",
@@ -154,16 +154,19 @@ def sqs_record(request_id, attempt=1):
     return {"body": "placeholder", "attributes": {"ApproximateReceiveCount": str(attempt)}}
 
 
-def make_message(request_id, attachments):
-    return {
+def make_message(request_id, attachments, **overrides):
+    message = {
         "request_id": request_id,
         "api_key_id": KEY_ID,
         "account_id": "acct_a",
-        "from_email": "hi@acme.com",
+        "from": "hi@acme.com",
+        "to": "u@example.com",
         "template_id": "tpl_x",
-        "template_params": {"to_email": "u@example.com", "to_name": "Sam"},
+        "template_params": {"to_name": "Sam"},
         "attachments": attachments,
     }
+    message.update(overrides)
+    return message
 
 
 def test_worker_sends_attachments_via_sesv2_and_deletes_them_on_success(w, table, bucket):
@@ -216,3 +219,70 @@ def test_worker_deletes_the_attachment_after_a_final_failure(w, table, bucket):
 
     with pytest.raises(bucket.exceptions.NoSuchKey):
         bucket.get_object(Bucket=ATTACHMENTS_BUCKET, Key=key)
+
+
+# --- worker: reply_to, and the from/to top-level fields ---
+
+def test_worker_uses_the_top_level_from_and_to(w, table, bucket):
+    request_id = "r4"
+    table.put_item(Item={"PK": f"EMAIL#{request_id}", "SK": "META", "status": "queued", "attempts": 0})
+    record = sqs_record(request_id)
+    record["body"] = json.dumps(make_message(request_id, [], **{"from": "hi@acme.com", "to": "u@example.com"}))
+
+    w.handler({"Records": [record]}, None)
+
+    assert w.ses.send_email.call_args.kwargs["Source"] == "hi@acme.com"
+    assert w.ses.send_email.call_args.kwargs["Destination"] == {"ToAddresses": ["u@example.com"]}
+    assert table.get_item(Key={"PK": f"EMAIL#{request_id}", "SK": "META"})["Item"]["status"] == "sent"
+
+
+def test_worker_sets_reply_to_addresses_without_attachments(w, table, bucket):
+    request_id = "r5"
+    table.put_item(Item={"PK": f"EMAIL#{request_id}", "SK": "META", "status": "queued", "attempts": 0})
+    record = sqs_record(request_id)
+    record["body"] = json.dumps(make_message(request_id, [], reply_to="visitor@example.com"))
+
+    w.handler({"Records": [record]}, None)
+
+    assert w.ses.send_email.call_args.kwargs["ReplyToAddresses"] == ["visitor@example.com"]
+
+
+def test_worker_omits_reply_to_addresses_when_not_given(w, table, bucket):
+    request_id = "r6"
+    table.put_item(Item={"PK": f"EMAIL#{request_id}", "SK": "META", "status": "queued", "attempts": 0})
+    record = sqs_record(request_id)
+    record["body"] = json.dumps(make_message(request_id, []))
+
+    w.handler({"Records": [record]}, None)
+
+    assert "ReplyToAddresses" not in w.ses.send_email.call_args.kwargs
+
+
+def test_worker_puts_reply_to_in_the_raw_message_header_when_there_are_attachments(w, table, bucket):
+    request_id = "r7"
+    table.put_item(Item={"PK": f"EMAIL#{request_id}", "SK": "META", "status": "queued", "attempts": 0})
+    key = put_object(bucket, "acct_a", "f1", 10)
+    record = sqs_record(request_id)
+    record["body"] = json.dumps(
+        make_message(request_id, [{"object_key": key, "filename": "f1.pdf"}], reply_to="visitor@example.com")
+    )
+
+    w.handler({"Records": [record]}, None)
+
+    raw = w.sesv2.send_email.call_args.kwargs["Content"]["Raw"]["Data"]
+    assert b"Reply-To: visitor@example.com" in raw
+
+
+def test_worker_fails_a_message_missing_the_to_field(w, table):
+    request_id = "r8"
+    table.put_item(Item={"PK": f"EMAIL#{request_id}", "SK": "META", "status": "queued", "attempts": 0})
+    message = make_message(request_id, [])
+    del message["to"]
+    record = sqs_record(request_id)
+    record["body"] = json.dumps(message)
+
+    w.handler({"Records": [record]}, None)
+
+    item = table.get_item(Key={"PK": f"EMAIL#{request_id}", "SK": "META"})["Item"]
+    assert (item["status"], item["error_code"]) == ("failed", "INVALID_MESSAGE")
+    w.ses.send_email.assert_not_called()
