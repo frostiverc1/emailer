@@ -92,8 +92,8 @@ def _send(event):
     if allowed_origins and origin and origin not in allowed_origins:
         return _resp(403, {"error": "Origin not allowed"})
 
-    # --- 3. from must be on a verified domain owned by the key's account ---
-    sender_error = _sender_error(body["from"], account_id)
+    # --- 3. from must be on a verified domain, or be the account's connected Gmail address ---
+    sender_error, send_via = _sender_error(body["from"], account_id)
     if sender_error:
         return _resp(403, {"error": sender_error})
 
@@ -138,6 +138,7 @@ def _send(event):
                 "template_id": body["template_id"],
                 "template_params": body["template_params"],
                 "attachments": attachments,
+                "send_via": send_via,
                 "queued_at": datetime.utcnow().isoformat(),
             }),
         )
@@ -150,9 +151,10 @@ def _send(event):
 
 
 def _sender_error(from_email, account_id):
+    """Returns (error, None) or (None, "ses"|"gmail") for where the worker should send it from."""
     match = FROM_EMAIL.fullmatch(from_email) if isinstance(from_email, str) else None
     if not match:
-        return "from must be a plain email address, e.g. hello@yourdomain.com"
+        return "from must be a plain email address, e.g. hello@yourdomain.com", None
 
     domain = match.group(1).lower()
     record = ops_table.get_item(
@@ -160,10 +162,19 @@ def _sender_error(from_email, account_id):
         ProjectionExpression="account_id, #s",
         ExpressionAttributeNames={"#s": "status"},
     ).get("Item")
+    if record and record.get("account_id") == account_id and record.get("status") == "verified":
+        return None, "ses"
+
+    # Not a verified domain: allowed only if it's exactly the account's connected Gmail address —
+    # the OAuth grant only lets us send as that one address, not the whole gmail.com domain.
+    gmail = ops_table.get_item(
+        Key={"PK": f"ACCT#{account_id}", "SK": "GMAIL"}, ProjectionExpression="connected_email",
+    ).get("Item")
+    if gmail and gmail.get("connected_email", "").lower() == from_email.lower():
+        return None, "gmail"
+
     # Same message for "not added", "not verified yet" and "someone else's", so accounts can't probe each other.
-    if not record or record.get("account_id") != account_id or record.get("status") != "verified":
-        return f"{domain} is not a verified domain on this account"
-    return None
+    return f"{domain} is not a verified domain on this account", None
 
 
 def _upload_url(event):

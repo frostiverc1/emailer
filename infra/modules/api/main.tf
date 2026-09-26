@@ -30,12 +30,19 @@ locals {
     "DELETE /admin/domains/{domain}"     = { lambda = "domains", auth = "COGNITO", api_key = false }
     "POST /admin/domains/{domain}/check" = { lambda = "domains", auth = "COGNITO", api_key = false }
     "POST /admin/domains/{domain}/retry" = { lambda = "domains", auth = "COGNITO", api_key = false }
+    "GET /admin/gmail/connect"           = { lambda = "gmail", auth = "COGNITO", api_key = false }
+    # Public: Google's redirect back from the consent screen carries no Cognito token. The gmail
+    # Lambda ties it back to an account itself via the one-time state token from /connect.
+    "GET /admin/gmail/callback" = { lambda = "gmail", auth = "NONE", api_key = false }
+    "GET /admin/gmail"          = { lambda = "gmail", auth = "COGNITO", api_key = false }
+    "DELETE /admin/gmail"       = { lambda = "gmail", auth = "COGNITO", api_key = false }
   }
 
   lambda_arns = {
     validate = aws_lambda_function.validate.invoke_arn
     admin    = aws_lambda_function.admin.invoke_arn
     domains  = aws_lambda_function.domains.invoke_arn
+    gmail    = aws_lambda_function.gmail.invoke_arn
     # stripe_webhook = aws_lambda_function.stripe_webhook.invoke_arn
   }
 
@@ -43,6 +50,7 @@ locals {
     validate = aws_lambda_function.validate.function_name
     admin    = aws_lambda_function.admin.function_name
     domains  = aws_lambda_function.domains.function_name
+    gmail    = aws_lambda_function.gmail.function_name
     # stripe_webhook = aws_lambda_function.stripe_webhook.function_name
   }
 

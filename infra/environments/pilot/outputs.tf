@@ -21,3 +21,17 @@ output "queue_url" {
 output "ses_configuration_set_name" {
   value = module.email.ses_configuration_set_name
 }
+
+output "acm_validation_record" {
+  description = "Add this CNAME in brandflyers.com's DNS (a different AWS account) to prove ownership."
+  value       = module.api.acm_validation_record
+}
+
+output "custom_domain_target" {
+  description = "Point custom_domain at this with an ALIAS or CNAME record, in the same DNS."
+  value       = module.api.custom_domain_target
+}
+
+output "custom_domain_url" {
+  value = module.api.custom_domain_url
+}

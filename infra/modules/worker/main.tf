@@ -73,10 +73,12 @@ resource "aws_lambda_function" "worker" {
 
   environment {
     variables = {
-      OPS_TABLE_NAME          = var.ops_table_name
-      SES_REGION              = var.ses_region
-      MAX_RECEIVE_COUNT       = var.max_receive_count
-      ATTACHMENTS_BUCKET_NAME = var.attachments_bucket_name
+      OPS_TABLE_NAME             = var.ops_table_name
+      SES_REGION                 = var.ses_region
+      MAX_RECEIVE_COUNT          = var.max_receive_count
+      ATTACHMENTS_BUCKET_NAME    = var.attachments_bucket_name
+      GOOGLE_OAUTH_CLIENT_ID     = var.google_oauth_client_id
+      GOOGLE_OAUTH_CLIENT_SECRET = var.google_oauth_client_secret
       # Must exceed the Lambda timeout and stay below the queue visibility timeout.
       LEASE_SECONDS = 90
     }

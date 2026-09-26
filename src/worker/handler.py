@@ -1,6 +1,10 @@
+import base64
 import json
 import os
 import logging
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -18,6 +22,10 @@ ses = boto3.client("ses", region_name=os.environ.get("SES_REGION", "us-east-1"))
 sesv2 = boto3.client("sesv2", region_name=os.environ.get("SES_REGION", "us-east-1"))
 s3 = boto3.client("s3")
 ATTACHMENTS_BUCKET = os.environ.get("ATTACHMENTS_BUCKET_NAME")
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 
 MAX_RECEIVE_COUNT = int(os.environ["MAX_RECEIVE_COUNT"])
 LEASE_SECONDS = int(os.environ["LEASE_SECONDS"])
@@ -48,6 +56,13 @@ class PermanentError(Exception):
     def __init__(self, error_code, message):
         super().__init__(message)
         self.error_code = error_code
+
+
+class GmailError(Exception):
+    def __init__(self, error_code, message, retryable):
+        super().__init__(message)
+        self.error_code = error_code
+        self.retryable = retryable
 
 
 def handler(event, context):
@@ -150,18 +165,26 @@ def _process(msg):
     html_body = Template(t["html_tpl"], autoescape=True).render(**params)
     text_body = Template(t["text_tpl"]).render(**params) if t.get("text_tpl") else None
 
-    # 3. send via SES. validate already checked from is on one of the account's verified domains.
+    # 3. send. validate already checked from is on a verified domain, or the connected Gmail address.
     attachments = msg.get("attachments") or []
-    message_id = _send_via_ses(
-        msg["from"], to_email, subject, html_body, text_body, request_id, msg["api_key_id"], attachments,
-        reply_to=msg.get("reply_to"),
-    )
+    reply_to = msg.get("reply_to")
+    if msg.get("send_via") == "gmail":
+        message_id = _send_via_gmail(
+            msg["account_id"], msg["from"], to_email, subject, html_body, text_body, attachments, reply_to,
+        )
+    else:
+        message_id = _send_via_ses(
+            msg["from"], to_email, subject, html_body, text_body, request_id, msg["api_key_id"], attachments,
+            reply_to=reply_to,
+        )
 
     logger.info(f"Sent email | request_id={request_id} to={to_email}")
     return message_id
 
 
 def _classify(exc):
+    if isinstance(exc, GmailError):
+        return exc.error_code, exc.retryable
     if isinstance(exc, PermanentError):
         return exc.error_code, False
     if isinstance(exc, TemplateSyntaxError):
@@ -241,6 +264,58 @@ def _send_via_ses(from_email, to_email, subject, html_body, text_body, request_i
         EmailTags=[{"Name": "request_id", "Value": request_id}, {"Name": "api_key_id", "Value": api_key_id}],
     )
     return response["MessageId"]
+
+
+def _send_via_gmail(account_id, from_email, to_email, subject, html_body, text_body, attachments, reply_to=None):
+    gmail = table.get_item(
+        Key={"PK": f"ACCT#{account_id}", "SK": "GMAIL"}, ProjectionExpression="refresh_token",
+    ).get("Item")
+    if not gmail or not gmail.get("refresh_token"):
+        raise GmailError("GMAIL_DISCONNECTED", "Gmail is not connected for this account", retryable=False)
+
+    access_token = _refresh_gmail_access_token(gmail["refresh_token"])
+    raw = _build_mime_message(from_email, to_email, subject, html_body, text_body, attachments, reply_to)
+    body = {"raw": base64.urlsafe_b64encode(raw).decode().rstrip("=")}
+
+    req = urllib.request.Request(
+        GMAIL_SEND_URL,
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read()).get("id")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        # 4xx (bad address, message rejected, scope revoked mid-flight) won't succeed on retry.
+        # 5xx/429 from Gmail's side are worth a redelivery, same as SES's transient errors.
+        retryable = exc.code >= 500 or exc.code == 429
+        raise GmailError("GMAIL_SEND_FAILED", f"Gmail API returned {exc.code}: {detail}", retryable) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise GmailError("NETWORK", str(exc), retryable=True) from exc
+
+
+def _refresh_gmail_access_token(refresh_token):
+    data = urllib.parse.urlencode({
+        "refresh_token": refresh_token,
+        "client_id": GOOGLE_OAUTH_CLIENT_ID,
+        "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+    }).encode()
+    req = urllib.request.Request(GOOGLE_TOKEN_URL, data=data, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())["access_token"]
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        # invalid_grant means the customer revoked access from their Google account; reconnecting
+        # is the only fix, so this must not retry.
+        if exc.code == 400 and "invalid_grant" in detail:
+            raise GmailError("GMAIL_REVOKED", "Gmail access was revoked; reconnect the account", retryable=False) from exc
+        raise GmailError("GMAIL_AUTH_FAILED", f"Google token refresh returned {exc.code}: {detail}", retryable=True) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise GmailError("NETWORK", str(exc), retryable=True) from exc
 
 
 def _build_mime_message(from_email, to_email, subject, html_body, text_body, attachments, reply_to=None):

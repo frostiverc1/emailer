@@ -43,3 +43,14 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "google_oauth_client_id" {
+  description = "OAuth 2.0 client ID, used to refresh Gmail access tokens when sending via the Gmail fallback."
+  type        = string
+}
+
+variable "google_oauth_client_secret" {
+  description = "OAuth 2.0 client secret matching google_oauth_client_id."
+  type        = string
+  sensitive   = true
+}
