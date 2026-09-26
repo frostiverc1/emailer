@@ -10,9 +10,7 @@ build/
 crash.log
 crash.*.log
 .terraform.tfstate.lock.info
-
-infra\environments\pilot\terraform.tfvars
-
+infra/environments/pilot/terraform.tfvars
 # Lambda packaging artifacts (built locally by terraform apply)
 infra/build/
 __pycache__/
